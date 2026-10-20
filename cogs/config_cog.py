@@ -493,9 +493,13 @@ class ConfigCog(commands.Cog, name="Config"):
         """True when the caller owns the bot application.
 
         The host renewal is account-level, not per-guild, so Manage Server is the
-        wrong gate. ``discord.utils`` has no helper for this that avoids a fetch,
-        and ``interaction.client.application_info()`` is cached after first call.
+        wrong gate. Delegates to the reminder's cached lookup when it exists, so
+        the button and this command cannot disagree about who the owner is.
         """
+        reminder = getattr(interaction.client, "rotation_reminder", None)
+        if reminder is not None:
+            return await reminder.is_owner(interaction.user.id)
+
         try:
             info = await interaction.client.application_info()
         except Exception as exc:  # noqa: BLE001

@@ -80,7 +80,6 @@ Everything is editable from **both** Discord and the dashboard. In Discord:
 | `/config replies` | List, add, remove, toggle, reset fun action replies |
 | `/config qotd` | Toggle, time, timezone, channel, role, days, add, list, remove, next, skip |
 | `/config dev renewed` | Bot owner only. Resets the host-renewal reminder clock. |
-
 All `/config` subcommands require **Manage Server**, except `/config dev renewed`
 which requires being the **bot owner** — the host renewal is an account-level
 concern, not a per-server setting.
@@ -122,11 +121,23 @@ Three days against a four-day window leaves a day of headroom, so the reminder
 arrives while there is still time to act.
 
 The reminder is delivered as a **DM to the bot owner**, resolved from Discord
-(`application_info().owner`) so no extra configuration is needed. If DMs are
-closed it falls back to each guild's log channel, and an account-level row is
-written to `bot_events` for the dashboard feed.
+(`application_info().owner`) so no extra configuration is needed. The DM carries
+a single **"I've renewed"** button: press it and the countdown restarts. If DMs
+are closed the reminder falls back to each guild's log channel, and an
+account-level row is written to `bot_events` for the dashboard feed.
 
-After renewing, run **`/config dev renewed`** (bot owner only) to reset the clock.
+`/config dev renewed` (bot owner only) does the same thing from slash commands,
+for when the DM has scrolled away.
+
+### The button survives restarts
+
+The button is a **persistent view** — a fixed `custom_id` with no timeout — and
+it is re-registered on every startup. This matters more than it looks: the
+reminder DM sits in your inbox indefinitely, and the click that matters most
+happens *right after* a restart, because renewing the host is what restarts the
+bot. An ordinary button holding an in-memory reference would already be dead by
+then. Once pressed, the button disables itself so it cannot be double-fired, and
+only the bot owner can use it.
 
 ### Why uptime, and what that costs you
 
@@ -142,8 +153,8 @@ or treat the restarts themselves as the signal.
 
 The boot time is recorded in a marker file beside the log file (`.boot_time`
 under `logs/`). Deliberately, the marker is **not** rewritten on every start —
-only `/config dev renewed` resets it — otherwise a host that restarts hourly
-would never reach the threshold.
+only a renewal acknowledgement (the button, or `/config dev renewed`) resets it —
+otherwise a host that restarts hourly would never reach the threshold.
 
 ---
 

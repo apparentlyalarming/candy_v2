@@ -28,7 +28,7 @@ from config import settings
 from db import realtime
 from services.config_service import ConfigService
 from services.groq_service import GroqService
-from services.rotation_reminder import RotationReminder, build_reminder
+from services.rotation_reminder import RenewalButtonView, RotationReminder, build_reminder
 from utils.event_log import make_emitter
 from utils.logging_setup import get_logger, setup_logging
 
@@ -125,6 +125,12 @@ class CandyBot(commands.Bot):
                 threshold_days=settings.rotation_reminder_days,
             )
             self.rotation_reminder.start()
+
+            # Persistent view: reminder DMs sent by this or any PREVIOUS process
+            # keep a working button. Without this registration the button dies on
+            # restart, which is precisely when it is most needed - renewing the
+            # host restarts the bot, and the owner then clicks the old message.
+            self.add_view(RenewalButtonView(self.rotation_reminder))
 
         # 6. Load cogs.
         await self._load_cogs()
