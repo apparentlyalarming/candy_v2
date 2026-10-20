@@ -75,6 +75,11 @@ class FunCog(commands.Cog, name="Fun"):
 
         Commands are built with app_commands.Command directly (rather than the
         decorator) because the set is data-driven and generated at runtime.
+
+        The `user` option is declared by the callback's own signature - discord.py
+        derives app command parameters from the function annotations. There is no
+        public API for constructing a Parameter object by hand, so we annotate and
+        then attach the description via the transformer.
         """
         created = 0
         for key, action in sorted(self._action_map.items()):
@@ -86,21 +91,14 @@ class FunCog(commands.Cog, name="Fun"):
                 break
 
             label = str(action.get("label") or key.title())
-            callback = self._make_callback(key)
 
             command = app_commands.Command(
                 name=key,
                 description=f"{label} someone.",
-                callback=callback,
+                callback=self._make_callback(key),
             )
-            command.parameters = [
-                app_commands.Parameter(
-                    name="user",
-                    description="Who to direct this at.",
-                    required=True,
-                    type=discord.AppCommandOptionType.user,
-                )
-            ]
+            # Descriptions for the options come from the callback's annotations.
+            command._params["user"].description = "Who to direct this at."
 
             if self.bot.tree.get_command(key) is not None:
                 self.bot.tree.remove_command(key)
@@ -110,7 +108,16 @@ class FunCog(commands.Cog, name="Fun"):
             created += 1
 
     def _make_callback(self, action_key: str):
-        async def _callback(interaction: discord.Interaction, user: discord.User) -> None:
+        """Return a callback with a typed `user` parameter.
+
+        The annotation is what makes discord.py emit a USER option; the default
+        makes it optional so `/hug` alone is valid (the seed includes targetless
+        replies such as dance).
+        """
+        async def _callback(
+            interaction: discord.Interaction,
+            user: discord.User | None = None,
+        ) -> None:
             await self._handle_slash(interaction, action_key, user)
 
         return _callback
@@ -153,7 +160,10 @@ class FunCog(commands.Cog, name="Fun"):
             return None
 
     async def _handle_slash(
-        self, interaction: discord.Interaction, action: str, target: discord.User
+        self,
+        interaction: discord.Interaction,
+        action: str,
+        target: discord.User | None,
     ) -> None:
         if interaction.guild_id is None:
             await interaction.response.send_message(
@@ -161,7 +171,12 @@ class FunCog(commands.Cog, name="Fun"):
             )
             return
 
-        if target.id == interaction.user.id:
+        # Targetless invocations (e.g. /dance) are allowed. The action's own
+        # template decides whether it mentions anyone: targetless replies simply
+        # do not contain {target}.
+        target_id = target.id if target is not None else interaction.user.id
+
+        if target is not None and target.id == interaction.user.id:
             await interaction.response.send_message(
                 _self_target_message(action), ephemeral=True
             )
@@ -172,7 +187,7 @@ class FunCog(commands.Cog, name="Fun"):
         text = await self.run_fun_action(
             guild_id=interaction.guild_id,
             author_id=interaction.user.id,
-            target_id=target.id,
+            target_id=target_id,
             action=action,
         )
 
@@ -185,7 +200,7 @@ class FunCog(commands.Cog, name="Fun"):
             return
 
         await interaction.followup.send(text)
-        await self._log_usage(interaction, action, target.id)
+        await self._log_usage(interaction, action, target_id)
 
     async def _log_usage(
         self, interaction: discord.Interaction, action: str, target_id: int
@@ -224,37 +239,45 @@ class FunCog(commands.Cog, name="Fun"):
             return True
 
         target = await self._resolve_target(message, parts[1] if len(parts) > 1 else "")
-        if target is None:
-            await message.reply(f"Usage: `{prefix}{action} @user`", mention_author=False)
-            return True
 
-        if target.id == message.author.id:
+        if target is not None and target.id == message.author.id:
             await message.reply(_self_target_message(action), mention_author=False)
             return True
+
+        # No target given: allowed for targetless actions like !dance. Templates
+        # that use {target} simply will not fire for those, and we fall through to
+        # the "empty list" message rather than crashing.
+        target_id = target.id if target is not None else message.author.id
 
         text = await self.run_fun_action(
             guild_id=message.guild.id,
             author_id=message.author.id,
-            target_id=target.id,
+            target_id=target_id,
             action=action,
         )
 
         if text is None:
-            await message.reply(
-                f"The **{action}** reply list is empty or disabled here.",
-                mention_author=False,
-            )
+            if target is None:
+                await message.reply(
+                    f"Usage: `{prefix}{action} @user`", mention_author=False
+                )
+            else:
+                await message.reply(
+                    f"The **{action}** reply list is empty or disabled here.",
+                    mention_author=False,
+                )
             return True
 
         await message.reply(text, mention_author=False)
 
         emitter = getattr(self.bot, "emit_log", None)
         if emitter is not None:
+            target_label = target.mention if target is not None else "themselves"
             await emitter(
                 message.guild.id,
                 "commands",
                 title=f"{prefix}{action}",
-                description=f"{message.author.mention} used `{action}` on {target.mention}.",
+                description=f"{message.author.mention} used `{action}` on {target_label}.",
                 channel_id=message.channel.id,
                 actor_id=message.author.id,
             )

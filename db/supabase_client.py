@@ -73,6 +73,16 @@ def upsert(table: str, payload: dict[str, Any], *, on_conflict: str | None = Non
     return list(response.data or [])
 
 
+def insert(table: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """INSERT one or many rows. Returns the written rows.
+
+    Used for append-only tables (ai_interactions, bot_events) where a conflict
+    would be a bug rather than something to merge around.
+    """
+    response = get_client().table(table).insert(payload).execute()
+    return list(response.data or [])
+
+
 def update(
     table: str, payload: dict[str, Any], *, filters: dict[str, Any]
 ) -> list[dict[str, Any]]:

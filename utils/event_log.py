@@ -227,9 +227,19 @@ class EventLogger:
 
 
 def make_emitter(bot: Any):
-    """Return a bound ``emit`` callable, stored on the bot as ``bot.emit_log``."""
+    """Attach an event logger to the bot and return its bound ``emit`` callable.
+
+    Sets BOTH attributes deliberately:
+      - ``bot.event_logger`` is the object (used to re-enable logging per guild)
+      - ``bot.emit_log``     is what every cog actually calls
+
+    Call sites use ``getattr(bot, "emit_log", None)`` and silently skip when it
+    is missing, so forgetting to set it here disables logging everywhere without
+    raising. That is why the two are set together.
+    """
     logger = EventLogger(bot)
     bot.event_logger = logger
+    bot.emit_log = logger.emit
     return logger.emit
 
 

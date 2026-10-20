@@ -156,9 +156,19 @@ class GeneralCog(commands.Cog, name="General"):
             if message.guild is None or message.type is not discord.MessageType.default:
                 return
 
+            # 3. Mentions get an AI reply when the channel is allowed. Checked
+            #    before the prefix so "@Candy hi" works with no prefix at all.
+            cleaned = self._strip_mention(message)
+            if cleaned is not None:
+                ai_cog = self.bot.get_cog("AI")
+                if ai_cog is not None:
+                    handled = await ai_cog.handle_mention(message, cleaned)  # type: ignore[attr-defined]
+                    if handled:
+                        return
+
             config = self.config.get(message.guild.id)
 
-            # 3. Prefix commands are opt-out per guild.
+            # 4. Prefix commands are opt-out per guild.
             if not config.prefix_enabled:
                 return
 
@@ -178,6 +188,26 @@ class GeneralCog(commands.Cog, name="General"):
                 await message.reply(f"Hello, {message.author.mention}! 🍬", mention_author=False)
         except Exception as exc:  # noqa: BLE001
             log.error("on_message dispatcher failed: %s", exc, exc_info=True)
+
+    def _strip_mention(self, message: discord.Message) -> str | None:
+        """Return the prompt if this message mentions the bot, else None.
+
+        An empty mention ("@Candy" with nothing else) returns an empty string,
+        which callers treat as "still a mention, but with no prompt".
+        Returns None when the bot is not mentioned at all.
+        """
+        me = self.bot.user
+        if me is None or not message.mentions:
+            return None
+        if not any(user.id == me.id for user in message.mentions):
+            return None
+
+        content = message.content or ""
+        # Strip both the plain <@id> and the nickname <@!id> forms, then collapse
+        # the double spaces the removal leaves behind ("hey  <@1>  there").
+        for token in (f"<@{me.id}>", f"<@!{me.id}>"):
+            content = content.replace(token, " ")
+        return " ".join(content.split()).strip()
 
 
 async def setup(bot: commands.Bot) -> None:

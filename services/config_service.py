@@ -168,6 +168,69 @@ class ConfigService:
         self._update_settings(guild_id, {"log_categories": resolved})
 
     # ------------------------------------------------------------------
+    # AI memory
+    # ------------------------------------------------------------------
+
+    def record_ai_interaction(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int | None,
+        user_id: int | None,
+        user_display_name: str | None,
+        result: Any,
+    ) -> None:
+        """Persist the SUMMARY of one AI exchange (never the full reply).
+
+        Called after a successful reply. Failures are logged and swallowed: the
+        user already has their answer, so a bookkeeping error must not surface.
+        Storage is bounded separately by :meth:`trim_ai_channel`.
+        """
+        gid = to_id(guild_id)
+        if gid is None:
+            return
+
+        row = result.as_row() if hasattr(result, "as_row") else {}
+        if not row:
+            return
+
+        row.update(
+            {
+                "guild_id": gid,
+                "channel_id": to_id(channel_id),
+                "discord_user_id": to_id(user_id),
+                "user_display_name": (user_display_name or None),
+                # user_id (the auth.users uuid) is intentionally left NULL: the
+                # bot knows the Discord id, not the Supabase account. The RLS
+                # "see your own" policy simply will not match bot-written rows,
+                # which is the correct default until the web links the two.
+            }
+        )
+
+        try:
+            supabase_client.insert("ai_interactions", row)
+        except Exception as exc:  # noqa: BLE001 - memory is best-effort
+            log.debug("Could not record ai_interaction: %s", exc)
+
+    def trim_ai_channel(self, guild_id: int, channel_id: int, keep: int = 50) -> int:
+        """Keep only the newest ``keep`` summaries for a channel. Returns deleted count."""
+        gid = to_id(guild_id)
+        cid = to_id(channel_id)
+        if gid is None or cid is None:
+            return 0
+        try:
+            return int(
+                supabase_client.call_rpc(
+                    "ai_trim_channel",
+                    {"p_guild_id": gid, "p_channel_id": cid, "p_keep": max(1, int(keep))},
+                )
+                or 0
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("ai_trim_channel failed: %s", exc)
+            return 0
+
+    # ------------------------------------------------------------------
     # chat AI
     # ------------------------------------------------------------------
 

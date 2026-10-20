@@ -65,6 +65,42 @@ class ChatMessage:
 
 
 @dataclass
+class ChatResult:
+    """Everything the Edge Function hands back for one exchange.
+
+    ``reply`` is what the user sees. ``summary`` is the one-line gist stored as
+    memory; it is what future calls recall, which is why it is carried separately
+    rather than re-derived from the reply text.
+    """
+
+    reply: str
+    summary: str = ""
+    degraded: bool = False
+    model: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    latency_ms: int = 0
+
+    def as_row(self) -> dict[str, Any]:
+        """Shape this result into an ``ai_interactions`` insert payload.
+
+        Deliberately excludes the full reply text: only the summary is retained
+        (see migration_002_logging.sql). Returns an empty dict when there is no
+        summary worth storing.
+        """
+        if not self.summary:
+            return {}
+        return {
+            "summary": self.summary,
+            "model": self.model or None,
+            "prompt_tokens": self.prompt_tokens or None,
+            "completion_tokens": self.completion_tokens or None,
+            "latency_ms": self.latency_ms or None,
+            "succeeded": not self.degraded,
+        }
+
+
+@dataclass
 class _ChannelState:
     """Per-channel conversation history and in-flight request tracking."""
 
@@ -115,7 +151,7 @@ class GroqService:
         max_tokens: int,
         temperature: float,
         cooldown_seconds: int,
-    ) -> str:
+    ) -> ChatResult:
         """Generate a reply to a message that mentioned the bot."""
         self._enforce_cooldown(guild_id, user_id, cooldown_seconds)
         return await self._complete(
@@ -145,7 +181,7 @@ class GroqService:
         max_tokens: int,
         temperature: float,
         cooldown_seconds: int,
-    ) -> str:
+    ) -> ChatResult:
         """Generate a reply to /ask."""
         self._enforce_cooldown(guild_id, user_id, cooldown_seconds)
         return await self._complete(
@@ -213,7 +249,7 @@ class GroqService:
         max_tokens: int,
         temperature: float,
         max_retries: int = MAX_RETRIES,
-    ) -> str:
+    ) -> ChatResult:
         """Call the Edge Function, retrying transient failures.
 
         One in-flight request per channel is enforced with a lock so two fast
@@ -236,6 +272,9 @@ class GroqService:
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
+                # Ask for {reply, summary} JSON. The function appends the format
+                # contract to our system prompt, so a guild's persona survives.
+                "structured": True,
             }
 
             headers = {
@@ -261,23 +300,30 @@ class GroqService:
                             "AI backend rejected the credentials. Check the chat function's secret."
                         )
 
+                    if response.status_code == 503:
+                        raise GroqUnavailable(
+                            "AI backend is not configured. Set GROQ_API_KEY as a Supabase secret."
+                        )
+
                     if response.status_code >= 500:
                         raise GroqUnavailable(
                             f"AI backend error {response.status_code}"
                         )
 
                     response.raise_for_status()
-                    text = self._extract_text(response.json())
-                    if not text:
+                    result = self._extract_result(response.json())
+                    if not result.reply:
                         raise GroqError("The AI returned an empty response.")
 
-                    # Record the exchange only on success.
+                    # Record the exchange only on success. We keep the REPLY in
+                    # the in-memory deque for immediate context, and hand the
+                    # SUMMARY to the caller so it can persist it to the database.
                     state.history.append(ChatMessage("user", f"{user_name}: {prompt}"))
-                    state.history.append(ChatMessage("assistant", text))
+                    state.history.append(ChatMessage("assistant", result.reply))
 
                     loop = asyncio.get_event_loop()
                     self._user_cooldowns[(guild_id, user_id)] = loop.time()
-                    return text
+                    return result
 
                 except GroqRateLimited:
                     raise
@@ -302,30 +348,47 @@ class GroqService:
             raise last_error or GroqError("AI request failed")
 
     @staticmethod
-    def _extract_text(body: Any) -> str:
-        """Pull the assistant text out of an OpenAI-compatible response.
+    def _extract_result(body: Any) -> ChatResult:
+        """Pull the structured result out of the Edge Function's response.
 
-        Tolerates the common shapes so a small change in the Edge Function's
-        response envelope does not break the bot.
+        Tolerates a raw OpenAI-compatible envelope too, so if the function is ever
+        bypassed (or a proxy strips our fields) the bot still gets the reply text.
         """
         if not isinstance(body, dict):
-            return ""
-        # Direct passthrough of the Groq response
+            return ChatResult(reply="")
+
+        # Our own envelope: { reply, summary, degraded, usage, latency_ms }.
+        reply = body.get("reply")
+        if isinstance(reply, str) and reply.strip():
+            usage = body.get("usage")
+            usage = usage if isinstance(usage, dict) else {}
+            return ChatResult(
+                reply=reply.strip(),
+                summary=str(body.get("summary") or "").strip(),
+                degraded=bool(body.get("degraded")),
+                model=str(body.get("model") or ""),
+                prompt_tokens=_as_int(usage.get("prompt_tokens")),
+                completion_tokens=_as_int(usage.get("completion_tokens")),
+                latency_ms=_as_int(body.get("latency_ms")),
+            )
+
+        # Fallback: a passthrough Groq response with no summary.
         choices = body.get("choices")
         if isinstance(choices, list) and choices:
             first = choices[0]
             if isinstance(first, dict):
                 message = first.get("message")
                 if isinstance(message, dict) and isinstance(message.get("content"), str):
-                    return message["content"].strip()
+                    return ChatResult(reply=message["content"].strip())
                 if isinstance(first.get("text"), str):
-                    return first["text"].strip()
-        # Simplified envelope: { "reply": "..." }
-        for key in ("reply", "content", "text", "output"):
+                    return ChatResult(reply=first["text"].strip())
+
+        for key in ("content", "text", "output"):
             value = body.get(key)
             if isinstance(value, str) and value.strip():
-                return value.strip()
-        return ""
+                return ChatResult(reply=value.strip())
+
+        return ChatResult(reply="")
 
 
 def _parse_retry_after(response: httpx.Response) -> float | None:
@@ -336,6 +399,14 @@ def _parse_retry_after(response: httpx.Response) -> float | None:
         return float(raw)
     except ValueError:
         return None
+
+
+def _as_int(value: Any) -> int:
+    """Best-effort int coercion for token counts and latency."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def build_service() -> GroqService:
@@ -352,5 +423,6 @@ __all__ = [
     "GroqRateLimited",
     "GroqUnavailable",
     "ChatMessage",
+    "ChatResult",
     "build_service",
 ]
