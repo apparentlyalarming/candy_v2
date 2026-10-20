@@ -27,6 +27,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from cogs import bind_group_commands
 from services.config_service import ConfigError, ConfigService
 from services.render import preview
 from utils.logging_setup import get_logger
@@ -683,4 +684,9 @@ async def setup(bot: commands.Bot) -> None:
     # Cog are, so the tree has to be given the root group explicitly.
     if bot.tree.get_command(config_group.name) is None:
         bot.tree.add_command(config_group)
-    await bot.add_cog(ConfigCog(bot, bot.config_service))  # type: ignore[attr-defined]
+    cog = ConfigCog(bot, bot.config_service)  # type: ignore[attr-defined]
+    await bot.add_cog(cog)
+    # Group children keep binding=None because the group is module level; see
+    # cogs.bind_group_commands for why that breaks every subcommand.
+    n = bind_group_commands(cog)
+    log.info("Bound %d config subcommand(s) to the cog instance", n)

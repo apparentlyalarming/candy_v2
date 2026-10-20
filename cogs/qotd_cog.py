@@ -17,6 +17,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from cogs import bind_group_commands
 from db.config_cache import GuildConfig
 from services.config_service import ConfigError, ConfigService
 from services.qotd_scheduler import (
@@ -433,4 +434,9 @@ async def setup(bot: commands.Bot) -> None:
     elif root is not config_cog.config_group:
         log.warning("A different 'config' command is already registered; leaving it alone")
 
-    await bot.add_cog(QotdCog(bot, bot.config_service))  # type: ignore[attr-defined]
+    cog = QotdCog(bot, bot.config_service)  # type: ignore[attr-defined]
+    await bot.add_cog(cog)
+    # See cogs.bind_group_commands: module-level groups leave binding=None,
+    # which makes every subcommand raise CommandSignatureMismatch.
+    n = bind_group_commands(cog)
+    log.info("Bound %d qotd subcommand(s) to the cog instance", n)
