@@ -499,7 +499,7 @@ class ConfigCog(commands.Cog, name="Config"):
         actions = await _to_thread(self.config.list_actions)
         if not actions:
             await interaction.response.send_message(
-                "No actions configured. Has `schema.sql` been run?", ephemeral=True
+                "No actions configured. Has `supabase/schema.sql` and `supabase/seed_replies.sql` been run?", ephemeral=True
             )
             return
 

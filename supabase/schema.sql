@@ -1,5 +1,5 @@
 -- ============================================================================
--- candy_v2 — Supabase schema + RLS
+-- candy_v2 — Supabase schema (structure + migrations, single file)
 -- ============================================================================
 -- HOW TO RUN:
 --   1. Open your Supabase project
@@ -10,14 +10,28 @@
 -- This file is IDEMPOTENT. Running it twice will not error or duplicate data.
 -- Safe to re-run after edits.
 --
+-- This file REPLACES the old split layout (schema.sql + migration_002/003/004).
+-- Everything is merged here in dependency order so a fresh install needs ONE
+-- paste. The migrations are gone; this is now the single source of truth for
+-- structure. Reply content still lives in supabase/seed_replies.sql.
+--
+-- CRITICAL: create table IF NOT EXISTS IS A NO-OP ON AN EXISTING TABLE.
+--   It never adds columns. That is why every added column below is ALSO
+--   declared with `alter table ... add column if not exists` (section 02b).
+--   A fresh install gets the columns from the create; an existing database
+--   gets them from the alter. Never rely on the create alone for new columns.
+--
 -- SECTIONS:
 --   01  Extensions
 --   02  Tables
+--   02b Column migrations (alter table ... add column if not exists)
 --   03  Indexes
---   04  RLS helper functions
+--   04  RLS helper functions  (can_manage_guild, is_dev, touch_updated_at)
 --   05  Row Level Security policies
+--   05b Atomic queue helpers
+--   05c AI memory retention  (ai_memory_prune)
 --   06  Realtime / replication
---   07  Seed data (reply action catalog)
+--   07  Logging / AI stats / activity feed  (ex-migration 002)
 --   08  Verification queries
 --
 -- CRITICAL CONVENTION:
@@ -63,6 +77,8 @@ create table if not exists public.guild_settings (
     -- general ---------------------------------------------------------------
     prefix                  text    not null default '!',
     log_channel_id          bigint,
+    log_enabled             boolean not null default true,      -- server event log on/off
+    log_categories          text[]  not null default '{config,errors,qotd}',  -- which events to log
 
     -- chat AI ---------------------------------------------------------------
     ai_enabled              boolean not null default false,
@@ -110,13 +126,17 @@ comment on table public.guild_settings is
 comment on column public.guild_settings.ai_channel_ids is
     'Channels where AI responds. Empty array = disabled (see ai_all_channels for everywhere).';
 comment on column public.guild_settings.ai_memory_enabled is
-    'When false the AI neither reads nor writes memory. Existing rows are left untouched, so re-enabling restores prior context.';
+    'When false the AI neither reads nor writes memory. Existing ai_memory rows are left untouched, so re-enabling restores prior context.';
 comment on column public.guild_settings.ai_memory_days is
     'How many days of AI memory to keep, per row (each row expires on its own Nth birthday). 0 = keep forever. Default 30.';
 comment on column public.guild_settings.ai_memory_ignored_channels is
     'Channels the AI neither records nor recalls. Per-channel escape hatch for channels where memory must stay off.';
 comment on column public.guild_settings.qotd_days is
     'Days of week QOTD fires: 1=Mon..7=Sun. Empty array = every day.';
+comment on column public.guild_settings.log_channel_id is
+    'Channel where the bot posts server event logs. NULL = logging off for this guild.';
+comment on column public.guild_settings.log_categories is
+    'Which event categories to log: config, commands, qotd, errors, members, ai.';
 
 
 -- ---------------------------------------------------------------------------
@@ -149,7 +169,7 @@ create table if not exists public.reply_actions (
 );
 
 comment on table public.reply_actions is
-    'Global shipped catalog of fun actions with default reply templates. Public read, no user writes.';
+    'Global shipped catalog of fun actions with default reply templates. Public read, no user writes. Rows are seeded by supabase/seed_replies.sql.';
 comment on column public.reply_actions.default_templates is
     'Templates use {user} and {target} placeholders. NEVER store raw <@id> mentions.';
 
@@ -201,9 +221,8 @@ comment on table public.qotd_questions is
 -- kept for the per-channel ignore list and for debugging, but the bot recalls the
 -- whole server the way a person recalls a room.
 --
--- This deliberately REVERSES the original no-transcripts stance (see
--- migration_004_ai_memory.sql). ai_interactions still stores no message text;
--- that table is analytics, this one is memory.
+-- This deliberately REVERSES the original no-transcripts stance. ai_interactions
+-- still stores no message text; that table is analytics, this one is memory.
 
 create table if not exists public.ai_memory (
     id                  bigserial primary key,
@@ -228,8 +247,142 @@ comment on table public.ai_memory is
     'Real AI conversation turns (prompt + reply) for restart-safe memory. Global per guild: retrieval filters on guild_id. One row per exchange.';
 comment on column public.ai_memory.channel_id is
     'Stored for the per-channel ignore list and for debugging. Retrieval is by guild_id, not this column.';
+comment on column public.ai_memory.discord_user_id is
+    'Discord snowflake of the prompt author. Drives the personalized !candyp lookup.';
 comment on column public.ai_memory.user_content is
     'The user prompt. Stored deliberately: a reply is uninterpretable without the prompt it answers.';
+
+
+-- ---------------------------------------------------------------------------
+-- ai_interactions: AI exchange SUMMARIES for analytics (never full text)
+-- ---------------------------------------------------------------------------
+-- Stores a SHORT summary per exchange, not the full transcript. Memory recall
+-- uses ai_memory instead; this table exists so the dashboard can show usage
+-- stats without ever exposing what anyone said.
+--
+-- RLS: a user can read their OWN rows across ALL servers. That is why user_id
+-- references auth.users directly rather than being guild-scoped.
+
+create table if not exists public.ai_interactions (
+    id          bigserial primary key,
+    guild_id    bigint references public.guilds(id) on delete cascade,
+    channel_id  bigint,
+    user_id     uuid references auth.users(id) on delete cascade,
+    discord_user_id bigint,                       -- denormalised for log reads
+    user_display_name text,
+
+    summary     text not null,                    -- the stored memory line
+    model       text,
+    prompt_tokens   integer,
+    completion_tokens integer,
+    latency_ms  integer,
+    succeeded   boolean not null default true,
+    error_kind  text,
+
+    created_at  timestamptz not null default now(),
+
+    constraint ai_interactions_summary_length check (length(summary) <= 500)
+);
+
+comment on table public.ai_interactions is
+    'AI exchange summaries used for analytics. Full transcripts are never stored here - see ai_memory for conversation turns.';
+comment on column public.ai_interactions.summary is
+    'One-line gist of the exchange. NOT the full reply text.';
+
+
+-- ---------------------------------------------------------------------------
+-- bot_events: dashboard activity feed (mirrors the Discord log channel)
+-- ---------------------------------------------------------------------------
+-- "Notable events only": config changes, command usage, QOTD fires, errors,
+-- member joins/leaves, AI failures. Not routine chatter.
+
+create table if not exists public.bot_events (
+    id          bigserial primary key,
+    guild_id    bigint references public.guilds(id) on delete cascade,
+    category    text not null,
+    title       text not null,
+    description text,
+    actor_id    bigint,
+    actor_name  text,
+    channel_id  bigint,
+    level       text not null default 'info',     -- info | warning | error
+    metadata    jsonb not null default '{}'::jsonb,
+    created_at  timestamptz not null default now(),
+
+    constraint bot_events_category_valid
+        check (category in ('config','commands','qotd','errors','members','ai')),
+    constraint bot_events_level_valid
+        check (level in ('info','warning','error'))
+);
+
+comment on table public.bot_events is
+    'Activity feed surfaced on the dashboard. Mirrors what goes to the Discord log channel.';
+
+
+-- ---------------------------------------------------------------------------
+-- dev_users: allowlist for elevated dashboard reads
+-- ---------------------------------------------------------------------------
+-- An allowlist TABLE rather than a config value, so granting is a data change
+-- rather than a deploy.
+
+create table if not exists public.dev_users (
+    user_id    uuid primary key references auth.users(id) on delete cascade,
+    note       text,
+    created_at timestamptz not null default now()
+);
+
+comment on table public.dev_users is
+    'Users allowed to read every ai_interactions row via is_dev(). Grant sparingly.';
+
+
+-- ============================================================================
+-- 02b  COLUMN MIGRATIONS
+-- ============================================================================
+-- Every column added after the original release is repeated here as an
+-- `add column if not exists`. This is what makes the file work on an EXISTING
+-- database: create table if not exists skips the whole column list, so the
+-- alter statements are the only thing that can add a column to a live table.
+--
+-- Keep this section in sync with the create statements above.
+
+alter table public.guild_settings
+    add column if not exists log_enabled    boolean not null default true,
+    add column if not exists log_categories text[]  not null default '{config,errors,qotd}';
+
+alter table public.guild_settings
+    add column if not exists ai_memory_enabled boolean not null default true;
+
+alter table public.guild_settings
+    add column if not exists ai_memory_days integer not null default 30;
+
+alter table public.guild_settings
+    add column if not exists ai_memory_ignored_channels bigint[] not null default '{}';
+
+-- Constrain log categories to the known set (guarded: constraint creation is
+-- not idempotent the way add column is).
+do $$
+begin
+    if not exists (
+        select 1 from pg_constraint where conname = 'guild_settings_log_categories_valid'
+    ) then
+        alter table public.guild_settings
+            add constraint guild_settings_log_categories_valid
+            check (log_categories <@ array['config','commands','qotd','errors','members','ai']::text[]);
+    end if;
+end $$;
+
+-- Range: 0 = keep forever, otherwise up to 10 years. Bounded so a typo cannot
+-- ask for a million-day window.
+do $$
+begin
+    if not exists (
+        select 1 from pg_constraint where conname = 'guild_settings_ai_memory_days_range'
+    ) then
+        alter table public.guild_settings
+            add constraint guild_settings_ai_memory_days_range
+            check (ai_memory_days >= 0 and ai_memory_days <= 3650);
+    end if;
+end $$;
 
 
 -- ============================================================================
@@ -267,6 +420,23 @@ create index if not exists ai_memory_guild_user_created_idx
 
 create index if not exists ai_memory_created_idx
     on public.ai_memory (created_at);
+
+-- AI interactions (analytics)
+create index if not exists ai_interactions_channel_idx
+    on public.ai_interactions (guild_id, channel_id, created_at desc);
+
+create index if not exists ai_interactions_user_idx
+    on public.ai_interactions (user_id, created_at desc);
+
+create index if not exists ai_interactions_guild_idx
+    on public.ai_interactions (guild_id, created_at desc);
+
+-- Activity feed
+create index if not exists bot_events_guild_idx
+    on public.bot_events (guild_id, created_at desc);
+
+create index if not exists bot_events_category_idx
+    on public.bot_events (guild_id, category, created_at desc);
 
 
 -- ============================================================================
@@ -337,6 +507,34 @@ revoke all on function public.can_manage_guild(bigint) from public;
 grant execute on function public.can_manage_guild(bigint) to authenticated;
 
 
+-- ---------------------------------------------------------------------------
+-- is_dev(): is the current user on the dev allowlist?
+--
+-- DEFINE THIS BEFORE ai_memory_prune() and ai_trim_channel(), which CALL it.
+-- It lives here (rather than in a migration) so this file is self-sufficient:
+-- previously schema.sql called is_dev() while only migration_002 created it, so
+-- a fresh install of schema.sql alone raised at runtime the first time pruning
+-- ran. Keeping the definition above its callers removes that trap.
+-- ---------------------------------------------------------------------------
+create or replace function public.is_dev()
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+    select exists (
+        select 1 from public.dev_users d where d.user_id = auth.uid()
+    );
+$$;
+
+comment on function public.is_dev() is
+    'True when the current user is on the dev allowlist. Used for elevated dashboard views and to authorize maintenance RPCs.';
+
+revoke all on function public.is_dev() from public;
+grant execute on function public.is_dev() to authenticated;
+
+
 -- ============================================================================
 -- 05  ROW LEVEL SECURITY
 -- ============================================================================
@@ -350,6 +548,9 @@ alter table public.reply_actions   enable row level security;
 alter table public.guild_replies   enable row level security;
 alter table public.qotd_questions  enable row level security;
 alter table public.ai_memory       enable row level security;
+alter table public.ai_interactions enable row level security;
+alter table public.bot_events      enable row level security;
+alter table public.dev_users       enable row level security;
 
 -- Belt and braces: also force RLS for table owners where applicable.
 alter table public.guilds          force row level security;
@@ -359,6 +560,9 @@ alter table public.reply_actions   force row level security;
 alter table public.guild_replies   force row level security;
 alter table public.qotd_questions  force row level security;
 alter table public.ai_memory       force row level security;
+alter table public.ai_interactions force row level security;
+alter table public.bot_events      force row level security;
+alter table public.dev_users       force row level security;
 
 -- ---------------------------------------------------------------------------
 -- guilds
@@ -500,6 +704,53 @@ create policy "ai_memory_select_managed"
     to authenticated
     using (public.can_manage_guild(guild_id));
 
+-- ---------------------------------------------------------------------------
+-- ai_interactions
+--
+-- User policy: read rows that belong to you, in ANY guild. This is the
+-- "users see their own across all servers" rule. A separate dev policy below
+-- lets allowlisted users read every row.
+-- ---------------------------------------------------------------------------
+drop policy if exists "ai_interactions_select_own" on public.ai_interactions;
+create policy "ai_interactions_select_own"
+    on public.ai_interactions
+    for select
+    to authenticated
+    using (user_id = auth.uid());
+
+drop policy if exists "ai_interactions_select_dev" on public.ai_interactions;
+create policy "ai_interactions_select_dev"
+    on public.ai_interactions
+    for select
+    to authenticated
+    using (public.is_dev());
+
+-- No insert/update/delete policies: only the bot (service_role) writes here.
+-- Users cannot fabricate or erase their own history through the API.
+
+-- ---------------------------------------------------------------------------
+-- bot_events: guild admins may read events for guilds they manage.
+-- ---------------------------------------------------------------------------
+drop policy if exists "bot_events_select_managed" on public.bot_events;
+create policy "bot_events_select_managed"
+    on public.bot_events
+    for select
+    to authenticated
+    using (public.can_manage_guild(guild_id));
+
+-- Writes are service_role only.
+
+-- ---------------------------------------------------------------------------
+-- dev_users: users may check whether THEY are a dev (needed for UI gating).
+-- They may not enumerate the list.
+-- ---------------------------------------------------------------------------
+drop policy if exists "dev_users_select_self" on public.dev_users;
+create policy "dev_users_select_self"
+    on public.dev_users
+    for select
+    to authenticated
+    using (user_id = auth.uid());
+
 
 -- ============================================================================
 -- 05b  ATOMIC QUEUE HELPERS
@@ -638,9 +889,12 @@ grant execute on function public.qotd_renumber(bigint) to authenticated;
 -- ============================================================================
 -- Called by the bot after each successful write, so storage stays bounded
 -- without a scheduled job. Per-row expiry: each row dies on its own Nth
--- birthday. There is deliberately NO table wipe.
+-- birthday. There is deliberately NO table wipe, and no count cap.
 --
 -- p_keep_days <= 0 means "keep forever" and is a no-op.
+--
+-- Depends on is_dev(), defined in section 04 ABOVE. Do not move this function
+-- above that definition.
 
 create or replace function public.ai_memory_prune(
     p_guild_id  bigint,
@@ -677,7 +931,7 @@ end;
 $$;
 
 comment on function public.ai_memory_prune(bigint, integer) is
-    'Deletes ai_memory rows older than p_keep_days for one guild. Per-row expiry, never a table wipe. p_keep_days <= 0 keeps forever.';
+    'Deletes ai_memory rows older than p_keep_days for one guild. Per-row expiry: each row dies on its own Nth birthday, never a table wipe. p_keep_days <= 0 keeps forever. Called by the bot on write; also safe to run from the SQL editor as service_role.';
 
 revoke all on function public.ai_memory_prune(bigint, integer) from public;
 grant execute on function public.ai_memory_prune(bigint, integer) to authenticated;
@@ -720,98 +974,144 @@ begin
         alter publication supabase_realtime add table public.guilds;
     exception when duplicate_object then null;
     end;
-exception
-    when undefined_object then
-        raise notice 'Publication supabase_realtime not found - enable Realtime in the dashboard instead.';
 end $$;
 
+-- bot_events is intentionally NOT published: it is high-volume and the
+-- dashboard can poll it. ai_interactions and ai_memory are NOT published
+-- either - they contain user text, and broadcasting it to subscribers is
+-- unnecessary.
+
 
 -- ============================================================================
--- 07  SEED DATA — fun action reply catalog
+-- 07  LOGGING, AI STATS, AND THE ACTIVITY FEED
 -- ============================================================================
--- Templates use {user} and {target}. NEVER raw <@id> mentions.
--- Add more actions here and re-run; keys are upserted.
+-- Formerly migration_002_logging.sql. Folded in here so a fresh install needs
+-- only this file. The tables (ai_interactions, bot_events, dev_users) and the
+-- log_* columns are declared in sections 02 and 02b; what follows is the
+-- admin-facing half: aggregate stats and the legacy rolling trim.
 
-insert into public.reply_actions (key, label, emoji, sort_order, default_templates)
-values
-    ('hug', 'Hug', '🤗', 10, array[
-        '{user} hugs {target} tightly',
-        '{user} wraps {target} in a warm hug',
-        '{user} gives {target} the softest hug ever',
-        '{user} pulls {target} into a big bear hug',
-        '{user} hugs {target} and refuses to let go'
-    ]),
-    ('pat', 'Pat', '🫳', 20, array[
-        '{user} pats {target} on the head',
-        '{user} gives {target} gentle headpats',
-        '{user} pats {target} softly, twice',
-        '{user} showers {target} with headpats'
-    ]),
-    ('poke', 'Poke', '👉', 30, array[
-        '{user} pokes {target}',
-        '{user} pokes {target} right in the cheek',
-        '{user} pokes {target} repeatedly until they respond',
-        '{user} pokes {target} with zero remorse'
-    ]),
-    ('cuddle', 'Cuddle', '🫂', 40, array[
-        '{user} cuddles up to {target}',
-        '{user} and {target} are now a cuddle puddle',
-        '{user} pulls {target} into a cozy cuddle',
-        '{user} cuddles {target} until they fall asleep'
-    ]),
-    ('boop', 'Boop', '👆', 50, array[
-        '{user} boops {target} on the nose',
-        '{user} gives {target} a tiny boop',
-        '{user} boops {target}. boop!',
-        '{user} sneaks up and boops {target}'
-    ]),
-    ('highfive', 'High Five', '🖐️', 60, array[
-        '{user} high-fives {target}!',
-        '{user} and {target} slap hands in perfect sync',
-        '{user} goes for the high five and {target} actually catches it',
-        '{user} high-fives {target} so hard it echoes'
-    ]),
-    ('wave', 'Wave', '👋', 70, array[
-        '{user} waves at {target}',
-        '{user} waves enthusiastically at {target}',
-        '{user} gives {target} a little wave',
-        '{user} waves at {target} from across the room'
-    ]),
-    ('dance', 'Dance', '💃', 80, array[
-        '{user} drags {target} onto the dance floor',
-        '{user} and {target} are dancing like nobody is watching',
-        '{user} shows {target} their best moves',
-        '{user} spins {target} around and dips them'
-    ]),
-    ('slap', 'Slap', '✋', 90, array[
-        '{user} slaps {target} with a trout',
-        '{user} slaps {target}. ouch!',
-        '{user} slaps {target} into next week',
-        '{user} delivers a dramatic slap to {target}'
-    ]),
-    ('kick', 'Kick', '🦵', 100, array[
-        '{user} kicks {target} into orbit',
-        '{user} kicks {target} gently (affectionate)',
-        '{user} winds up and kicks {target}',
-        '{user} kicks {target} straight out the door'
-    ]),
-    ('bite', 'Bite', '😬', 110, array[
-        '{user} bites {target}',
-        '{user} takes a small nibble out of {target}',
-        '{user} chomps {target} harmlessly',
-        '{user} bites {target} - purely a crime of passion'
-    ]),
-    ('bonk', 'Bonk', '🔨', 120, array[
-        '{user} bonks {target} on the head',
-        '{user} sends {target} to horny jail with a bonk',
-        '{user} bonks {target}. go to jail.',
-        '{user} applies a firm bonk to {target}'
-    ])
-on conflict (key) do update
-    set label             = excluded.label,
-        emoji             = excluded.emoji,
-        sort_order        = excluded.sort_order,
-        default_templates = excluded.default_templates;
+
+-- ---------------------------------------------------------------------------
+-- ai_stats_for_guild(): aggregates with NO message text
+-- ---------------------------------------------------------------------------
+-- Guild admins get usage stats but cannot read what anyone said. Enforced by
+-- the function's return type: there is simply no text column to leak.
+
+create or replace function public.ai_stats_for_guild(
+    p_guild_id bigint,
+    p_days     integer default 30
+)
+returns table (
+    total_interactions bigint,
+    successful         bigint,
+    failed             bigint,
+    unique_users       bigint,
+    avg_latency_ms     numeric,
+    total_prompt_tokens bigint,
+    total_completion_tokens bigint,
+    busiest_day        date,
+    busiest_day_count  bigint
+)
+language plpgsql
+security definer
+stable
+set search_path = public
+as $$
+declare
+    v_since timestamptz;
+begin
+    if not public.can_manage_guild(p_guild_id) then
+        raise exception 'not authorized for guild %', p_guild_id
+            using errcode = '42501';
+    end if;
+
+    v_since := now() - make_interval(days => greatest(1, least(p_days, 365)));
+
+    return query
+    with scoped as (
+        select *
+          from public.ai_interactions
+         where guild_id = p_guild_id
+           and created_at >= v_since
+    ),
+    by_day as (
+        select date_trunc('day', created_at)::date as day, count(*) as cnt
+          from scoped
+         group by 1
+         order by cnt desc
+         limit 1
+    )
+    select
+        (select count(*) from scoped)::bigint,
+        (select count(*) from scoped where succeeded)::bigint,
+        (select count(*) from scoped where not succeeded)::bigint,
+        (select count(distinct user_id) from scoped)::bigint,
+        (select round(avg(latency_ms), 1) from scoped where latency_ms is not null),
+        (select coalesce(sum(prompt_tokens), 0) from scoped)::bigint,
+        (select coalesce(sum(completion_tokens), 0) from scoped)::bigint,
+        (select day from by_day),
+        (select cnt from by_day)::bigint;
+end;
+$$;
+
+comment on function public.ai_stats_for_guild(bigint, integer) is
+    'Aggregate AI usage for guild admins. Returns counts only - never message text.';
+
+revoke all on function public.ai_stats_for_guild(bigint, integer) from public;
+grant execute on function public.ai_stats_for_guild(bigint, integer) to authenticated;
+
+
+-- ---------------------------------------------------------------------------
+-- ai_trim_channel(): rolling per-channel window over ai_interactions
+-- ---------------------------------------------------------------------------
+-- LEGACY. ai_interactions is analytics only now - memory lives in ai_memory
+-- and is bounded by ai_memory_prune() above. Kept because the bot still calls
+-- it defensively and because it is harmless. It is NOT the memory retention
+-- mechanism; do not mistake it for one.
+--
+-- Keeps the newest p_keep summaries for a channel and deletes the rest.
+
+create or replace function public.ai_trim_channel(
+    p_guild_id   bigint,
+    p_channel_id bigint,
+    p_keep       integer default 50
+)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_deleted integer;
+begin
+    -- Service role or dev only. Regular users have no business trimming.
+    if auth.role() <> 'service_role' and not public.is_dev() then
+        raise exception 'not authorized to trim ai interactions'
+            using errcode = '42501';
+    end if;
+
+    with doomed as (
+        select id
+          from public.ai_interactions
+         where guild_id = p_guild_id
+           and channel_id = p_channel_id
+         order by created_at desc
+        offset greatest(1, p_keep)
+    )
+    delete from public.ai_interactions a
+     using doomed d
+     where a.id = d.id;
+
+    get diagnostics v_deleted = row_count;
+    return v_deleted;
+end;
+$$;
+
+comment on function public.ai_trim_channel(bigint, bigint, integer) is
+    'LEGACY. Keeps only the newest p_keep ai_interactions summaries for a channel. Not the memory retention path - see ai_memory_prune().';
+
+revoke all on function public.ai_trim_channel(bigint, bigint, integer) from public;
+grant execute on function public.ai_trim_channel(bigint, bigint, integer) to authenticated, service_role;
 
 
 -- ============================================================================
@@ -819,21 +1119,21 @@ on conflict (key) do update
 -- ============================================================================
 -- Run these after the script to confirm everything landed.
 
--- 08.1 Tables exist (expect 7 rows)
+-- 08.1 Tables exist (expect 10 rows)
 -- select tablename
 --   from pg_tables
 --  where schemaname = 'public'
 --    and tablename in ('guilds','guild_settings','user_guilds',
 --                      'reply_actions','guild_replies','qotd_questions',
---                      'ai_memory')
+--                      'ai_memory','ai_interactions','bot_events','dev_users')
 --  order by tablename;
 
--- 08.2 RLS enabled on all 7 (expect rls_enabled = true everywhere)
+-- 08.2 RLS enabled on all 10 (expect rls_enabled = true everywhere)
 -- select relname as table_name, relrowsecurity as rls_enabled, relforcerowsecurity as rls_forced
 --   from pg_class
 --  where relname in ('guilds','guild_settings','user_guilds',
 --                    'reply_actions','guild_replies','qotd_questions',
---                    'ai_memory');
+--                    'ai_memory','ai_interactions','bot_events','dev_users');
 
 -- 08.3 Policy count per table (expect a sensible number, not 0)
 -- select tablename, count(*) as policy_count
@@ -842,16 +1142,26 @@ on conflict (key) do update
 --  group by tablename
 --  order by tablename;
 
--- 08.4 Seed catalog loaded (expect 12 rows)
+-- 08.4 Seed catalog loaded (expect 13 rows - run supabase/seed_replies.sql first)
 -- select key, label, array_length(default_templates, 1) as template_count
 --   from public.reply_actions
 --  order by sort_order;
 
--- 08.5 Helper function exists
+-- 08.5 Helper functions exist (expect 6 rows)
 -- select proname, prosecdef as is_security_definer
 --   from pg_proc
---  where proname in ('can_manage_guild','qotd_add_question',
+--  where proname in ('can_manage_guild','is_dev','qotd_add_question',
 --                    'qotd_move_question','qotd_renumber','ai_memory_prune');
+
+-- 08.6 The dependency chain actually works (expect 0, not an error).
+--      This is the real test: before is_dev() was folded into this file,
+--      calling this raised because is_dev() did not exist.
+-- select public.ai_memory_prune(0, 30);
+
+-- 08.7 Make yourself a dev (replacing the uuid). Grants elevated dashboard reads.
+-- insert into public.dev_users (user_id, note)
+-- select id, 'owner' from auth.users where email = 'your@email.com'
+-- on conflict (user_id) do nothing;
 
 -- ============================================================================
 -- END OF SCHEMA

@@ -22,7 +22,7 @@ from utils.logging_setup import get_logger
 
 log = get_logger("services.config")
 
-# --- limits (mirror schema.sql CHECK constraints) ---------------------------
+# --- limits (mirror supabase/schema.sql CHECK constraints) -------------------
 
 MAX_PROMPT_LENGTH = 4000
 MAX_PREFIX_LENGTH = 5

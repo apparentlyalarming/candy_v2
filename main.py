@@ -152,7 +152,7 @@ class CandyBot(commands.Bot):
         except Exception as exc:
             log.error(
                 "Could not load the config cache: %s. "
-                "Check SUPABASE_URL / SUPABASE_SERVICE_KEY and that schema.sql has been run.",
+                "Check SUPABASE_URL / SUPABASE_SERVICE_KEY and that supabase/schema.sql has been run.",
                 exc,
                 exc_info=True,
             )

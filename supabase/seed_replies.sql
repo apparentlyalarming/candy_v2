@@ -1,14 +1,13 @@
 -- ============================================================================
 -- candy_v2 — seed reply catalog (ported from the original candy bot)
 -- ============================================================================
--- Run AFTER schema.sql. Idempotent: upserts on `key`, so re-running replaces
+-- Run AFTER supabase/schema.sql. Idempotent: upserts on `key`, so re-running replaces
 -- the default templates without touching guild overrides in guild_replies.
 --
 -- These are the ORIGINAL replies from the v1 bot, converted to the
 -- {user}/{target} placeholder format. Raw <@id> mentions are never stored.
 --
--- WHY A SEPARATE FILE: schema.sql defines structure; this file defines content.
--- You can edit or extend this without touching the schema, and a server that
+-- WHY A SEPARATE FILE: schema.sql defines structure; this file defines content.-- You can edit or extend this without touching the schema, and a server that
 -- has customised replies keeps its overrides (guild_replies is untouched).
 -- ============================================================================
 

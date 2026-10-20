@@ -19,7 +19,7 @@ log = get_logger("db.cache")
 
 
 # --- defaults ---------------------------------------------------------------
-# Must mirror the column defaults in schema.sql. Used when a guild has not been
+# Must mirror the column defaults in supabase/schema.sql. Used when a guild has not been
 # written to the DB yet (bot invited, no settings row created).
 
 DEFAULT_SETTINGS: dict[str, Any] = {

@@ -36,12 +36,13 @@ pip install -r requirements.txt
 cp .env.example .env      # then fill in DISCORD_TOKEN, SUPABASE_URL, SUPABASE_SERVICE_KEY
 
 # 3. Create the database (run these IN ORDER in the Supabase SQL editor)
-#    schema.sql                    -> tables, RLS, QOTD queue functions
-#    seed_replies.sql              -> the fun action reply catalog
-#    migration_002_logging.sql     -> logging, AI stats, activity feed
-#    migration_003_ai_memory.sql   -> AI memory on/off toggle
-#    migration_004_ai_memory.sql   -> persistent memory (real turns) + retention
-#    (existing installs: only the migrations you have not run yet)
+#    supabase/schema.sql        -> EVERYTHING structural: tables, columns,
+#                                  indexes, RLS, queue helpers, memory
+#                                  retention, logging, AI stats
+#    supabase/seed_replies.sql  -> the fun action reply catalog (content only)
+#
+#    Two files, both idempotent. schema.sql is self-sufficient: it needs no
+#    migrations and can be re-run safely, on both fresh and existing databases.
 
 # 4. Run
 python main.py
@@ -255,11 +256,10 @@ restores the configured depth rather than resetting it to zero.
 ```
 main.py                   Entry point and startup order
 config.py                 Environment configuration
-schema.sql                Tables, RLS, QOTD queue functions   (run 1st)
-seed_replies.sql          Fun action reply catalog            (run 2nd)
-migration_002_logging.sql Logging, AI stats, activity feed     (run 3rd)
-migration_003_ai_memory.sql AI memory on/off toggle            (run 4th)
-migration_004_ai_memory.sql Persistent memory + retention      (run 5th)
+supabase/schema.sql       ALL structure: tables, columns, indexes, RLS,
+                          queue helpers, memory retention, logging,
+                          AI stats                       (run 1st)
+supabase/seed_replies.sql Fun action reply catalog        (run 2nd)
 
 db/                       Supabase client, config cache, Realtime listener
 services/                 Config writes, Groq client, rendering, QOTD scheduler,
