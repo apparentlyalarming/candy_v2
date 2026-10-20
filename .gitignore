@@ -64,9 +64,19 @@ data/
 *.db
 
 # --- Supabase local dev ------------------------------------------------------
+# CLI state from `supabase link` (holds the project ref; machine-local, not shared).
 supabase/.temp/
 supabase/.branches/
 .supabase/
+# Local stack overrides. The deployed project's real settings live in the
+# Supabase dashboard, not here.
+supabase/config.toml
+supabase/.env
+
+# NOTE: supabase/functions/** IS tracked on purpose. The Edge Function source is
+# version-controlled here alongside the bot that calls it, so the request and
+# response contract can never drift between the two. Deploy it with:
+#   supabase functions deploy chat --use-api
 
 # --- Editors / OS ------------------------------------------------------------
 .vscode/
