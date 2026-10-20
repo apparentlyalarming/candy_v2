@@ -12,13 +12,16 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Iterable
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from db import config_cache, supabase_client
 from db.config_cache import DEFAULT_SETTINGS, GuildConfig
 from services.render import TemplateError, validate_template_list
 from utils.discord_ids import to_id, to_id_list
 from utils.logging_setup import get_logger
+from utils.timezones import (
+    TimezoneError as _InputTimezoneError,
+    normalize_timezone_input,
+)
 
 log = get_logger("services.config")
 
@@ -46,6 +49,15 @@ QOTD_DAYS_VALID = {1, 2, 3, 4, 5, 6, 7}
 
 class ConfigError(ValueError):
     """Raised when a proposed configuration value is invalid."""
+
+
+class TimezoneError(ConfigError, _InputTimezoneError):
+    """Bad timezone syntax (neither IANA nor offset).
+
+    Subclasses ConfigError so every existing `except ConfigError` path keeps
+    working, and utils.timezones.TimezoneError so the QOTD cog can catch it
+    specifically and render the embed with the "Google it" button.
+    """
 
 
 class ConfigService:
@@ -598,16 +610,18 @@ class ConfigService:
         self._update_settings(guild_id, {"qotd_time": f"{hour:02d}:{minute:02d}:00"})
 
     def set_qotd_timezone(self, guild_id: int, timezone_name: str) -> None:
-        cleaned = (timezone_name or "").strip()
-        if not cleaned:
-            raise ConfigError("timezone must not be empty")
+        """Accepts an IANA name or a fixed offset ('UTC+5:30', '-8:00').
+
+        Raises TimezoneError (a ConfigError) on bad syntax so the cog can
+        render the helpful embed with a search button.
+        """
         try:
-            ZoneInfo(cleaned)
-        except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise ConfigError(
-                f"unknown timezone {cleaned!r}. Use an IANA name such as Asia/Kolkata or Europe/London."
-            ) from exc
-        self._update_settings(guild_id, {"qotd_timezone": cleaned})
+            stored = normalize_timezone_input(timezone_name)
+        except _InputTimezoneError as exc:
+            # Re-raise as the ConfigError-flavoured subclass: plain
+            # `except ConfigError` handlers elsewhere must keep catching it.
+            raise TimezoneError(str(exc)) from exc
+        self._update_settings(guild_id, {"qotd_timezone": stored})
 
     def set_qotd_days(self, guild_id: int, days: Iterable[int] | None) -> None:
         resolved = sorted({int(d) for d in (days or [])})
@@ -784,4 +798,10 @@ def build_service() -> ConfigService:
     return ConfigService()
 
 
-__all__ = ["ConfigService", "ConfigError", "build_service", "DEFAULT_SETTINGS"]
+__all__ = [
+    "ConfigService",
+    "ConfigError",
+    "TimezoneError",
+    "build_service",
+    "DEFAULT_SETTINGS",
+]

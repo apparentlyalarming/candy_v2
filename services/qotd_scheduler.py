@@ -16,15 +16,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from datetime import date, datetime, time as dtime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone, tzinfo
 from typing import Awaitable, Callable
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
 
 from db import config_cache
 from db.config_cache import GuildConfig
 from services.config_service import ConfigService
 from utils.logging_setup import get_logger
+from utils.timezones import resolve_zone  # noqa: F401 - re-exported below
 
 log = get_logger("services.qotd")
 
@@ -50,21 +49,10 @@ def parse_local_time(raw: str | None) -> dtime | None:
     return None
 
 
-def resolve_zone(name: str | None) -> ZoneInfo:
-    """Resolve an IANA timezone name, falling back to UTC with a warning."""
-    if not name:
-        return ZoneInfo("UTC")
-    try:
-        return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError):
-        log.warning("Unknown timezone %r; falling back to UTC", name)
-        return ZoneInfo("UTC")
-
-
 def next_occurrence(
     now_utc: datetime,
     local_time: dtime,
-    zone: ZoneInfo,
+    zone: tzinfo,
     days: list[int],
     *,
     from_date: date | None = None,

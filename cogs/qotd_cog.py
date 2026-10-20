@@ -10,6 +10,7 @@ question queued so the next tick retries inside the grace window.
 
 from __future__ import annotations
 
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,7 +20,7 @@ from discord.ext import commands
 
 from cogs import bind_group_commands
 from db.config_cache import GuildConfig
-from services.config_service import ConfigError, ConfigService
+from services.config_service import ConfigError, ConfigService, TimezoneError
 from services.qotd_scheduler import (
     QotdScheduler,
     next_occurrence,
@@ -29,6 +30,12 @@ from services.qotd_scheduler import (
 from utils.logging_setup import get_logger
 
 log = get_logger("cogs.qotd")
+
+# The column default, verbatim. Used ONLY to detect "the admin never chose a
+# timezone" for the status nudge: an explicit UTC choice is stored as
+# UTC+00:00 (see utils.timezones.normalize_timezone_input), so it never
+# matches this and never gets nudged.
+UNSET_TIMEZONE = "UTC"
 
 WEEKDAY_CHOICES = [
     app_commands.Choice(name="Monday", value=1),
@@ -178,6 +185,8 @@ class QotdCog(commands.Cog, name="QOTD"):
             f"**Ping role:** {f'<@&{config.qotd_role_id}>' if config.qotd_role_id else 'none'}",
             f"**Days:** {_format_days(config.qotd_days)}",
             f"**Questions queued:** {len(queue)}",
+            f"**Empty-queue notice:** {'on' if config.qotd_empty_queue_notice else 'off'}"
+            " (`/config qotd emptynotice`)",
         ]
 
         # Show the next scheduled moment in the guild's own timezone. This is the
@@ -199,6 +208,14 @@ class QotdCog(commands.Cog, name="QOTD"):
 
         if self.scheduler is not None and self.scheduler.last_tick is not None:
             lines.append(f"**Scheduler last tick:** <t:{int(self.scheduler.last_tick.timestamp())}:R>")
+
+        # Nudge only servers that never chose (see UNSET_TIMEZONE): an
+        # explicit UTC+00:00 does not match, so nobody who decided gets nagged.
+        if config.qotd_timezone == UNSET_TIMEZONE:
+            lines.append(
+                "💡 **Timezone not set** (using UTC). If your server isn't on UTC, "
+                "set it, e.g. `/config qotd settz UTC+5:30` or `Asia/Kolkata`."
+            )
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -224,12 +241,37 @@ class QotdCog(commands.Cog, name="QOTD"):
         )
 
     @qotd_group.command(name="settz", description="Set the timezone used for the schedule.")
-    @app_commands.describe(timezone_name="IANA name, e.g. Asia/Kolkata")
+    @app_commands.describe(
+        timezone_name="UTC+5:30 offset, or an IANA name like Asia/Kolkata"
+    )
     async def settz(self, interaction: discord.Interaction, timezone_name: str) -> None:
-        await self._apply(
-            interaction,
-            lambda gid: self.config.set_qotd_timezone(gid, timezone_name),
-            f"Timezone set to **{timezone_name}**.",
+        if interaction.guild_id is None:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+
+        try:
+            await discord.utils.maybe_coroutine(
+                self.config.set_qotd_timezone, interaction.guild_id, timezone_name
+            )
+        except TimezoneError:
+            # Syntax error, not any other ConfigError: show the embed with a
+            # search button instead of a bare error line.
+            await interaction.response.send_message(
+                embed=_timezone_help_embed(timezone_name),
+                view=_timezone_help_view(timezone_name),
+                ephemeral=True,
+            )
+            return
+        except ConfigError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        saved = self.config.get(interaction.guild_id).qotd_timezone
+        note = ""
+        if saved.startswith("UTC") and saved != "UTC":
+            note = " (fixed offset - no daylight saving shifts)"
+        await interaction.response.send_message(
+            f"Timezone set to **{saved}**.{note}", ephemeral=True
         )
 
     @qotd_group.command(name="setchannel", description="Set the channel questions post in.")
@@ -274,6 +316,24 @@ class QotdCog(commands.Cog, name="QOTD"):
             f"QOTD days set to **{_format_days(selected)}**."
             if selected
             else "QOTD will post **every day**.",
+        )
+
+    @qotd_group.command(
+        name="emptynotice",
+        description="Announce in the channel when the scheduled post finds an empty queue.",
+    )
+    @app_commands.describe(
+        enabled="True = post 'no questions queued' at the scheduled time, False = stay silent."
+    )
+    async def empty_notice(self, interaction: discord.Interaction, enabled: bool) -> None:
+        await self._apply(
+            interaction,
+            lambda gid: self.config.set_qotd_empty_notice(gid, enabled),
+            (
+                "QOTD will now **announce** when the queue is empty at the scheduled time."
+                if enabled
+                else "QOTD will stay **silent** when the queue is empty."
+            ),
         )
 
     @qotd_group.command(name="add", description="Add a question to the end of the queue.")
@@ -419,6 +479,39 @@ def _format_days(days: list[int]) -> str:
         return "every day"
     names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     return ", ".join(names[d - 1] for d in days if 1 <= d <= 7)
+
+
+def _timezone_help_view(bad_input: str) -> discord.ui.View:
+    """Link button that searches the user's own input, so a typo'd IANA name
+    finds the right spelling and an offset finds its timezone name."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="Google it for me",
+            style=discord.ButtonStyle.link,
+            emoji="🔍",
+            url="https://www.google.com/search?q="
+            + urllib.parse.quote(f"{bad_input} timezone"),
+        )
+    )
+    return view
+
+
+def _timezone_help_embed(bad_input: str) -> discord.Embed:
+    shown = bad_input if len(bad_input) <= 100 else bad_input[:97] + "..."
+    return discord.Embed(
+        title="❌ That timezone didn't parse",
+        description=(
+            f"I don't recognise `{shown}`.\n\n"
+            "**Accepted formats:**\n"
+            "• Offset — `UTC+5:30`, `+5`, `-8:00`, `UTC+0`\n"
+            "• IANA name — `Asia/Kolkata`, `Europe/London`\n\n"
+            "Offsets are fixed year-round (no DST). An IANA name follows "
+            "local daylight saving automatically. Not sure which to pick? "
+            "The button below searches for your input."
+        ),
+        colour=discord.Colour.red(),
+    )
 
 
 async def setup(bot: commands.Bot) -> None:

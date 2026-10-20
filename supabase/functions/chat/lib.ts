@@ -3,7 +3,7 @@
 // ============================================================================
 
 export interface ChatRequestBody {
-  /** Groq model id, e.g. "llama-3.3-70b-versatile". */
+  /** Groq model id, e.g. "openai/gpt-oss-120b". */
   model?: string;
   /** OpenAI-compatible message array: [{role, content}, ...]. */
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;

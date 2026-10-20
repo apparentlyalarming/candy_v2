@@ -76,6 +76,7 @@ create table if not exists public.guild_settings (
 
     -- general ---------------------------------------------------------------
     prefix                  text    not null default '!',
+    prefix_enabled          boolean not null default true,      -- text commands (!hug, !candy)
     log_channel_id          bigint,
     log_enabled             boolean not null default true,      -- server event log on/off
     log_categories          text[]  not null default '{config,errors,qotd}',  -- which events to log
@@ -123,6 +124,8 @@ create table if not exists public.guild_settings (
 
 comment on table public.guild_settings is
     'Per-guild bot configuration. Single source of truth for both slash commands and the dashboard.';
+comment on column public.guild_settings.prefix_enabled is
+    'Whether text/prefix commands (!hug, !candy) are active. Slash commands are unaffected.';
 comment on column public.guild_settings.ai_channel_ids is
     'Channels where AI responds. Empty array = disabled (see ai_all_channels for everywhere).';
 comment on column public.guild_settings.ai_memory_enabled is
@@ -348,6 +351,16 @@ comment on table public.dev_users is
 alter table public.guild_settings
     add column if not exists log_enabled    boolean not null default true,
     add column if not exists log_categories text[]  not null default '{config,errors,qotd}';
+
+-- MISSING SINCE THE ORIGINAL RELEASE. The bot has always written and read
+-- guild_settings.prefix_enabled (/config general prefixcommands, the status
+-- line, and the !hug/!candy gate in general_cog), but no schema file ever
+-- created the column. On a database that never had it, every write failed with
+-- 42703 and the status line silently reported the DEFAULT ("prefix commands:
+-- on") no matter what an admin saved. Adding it here is a no-op where the
+-- column already exists and creates it everywhere else.
+alter table public.guild_settings
+    add column if not exists prefix_enabled boolean not null default true;
 
 alter table public.guild_settings
     add column if not exists ai_memory_enabled boolean not null default true;
@@ -1175,6 +1188,34 @@ grant execute on function public.ai_trim_channel(bigint, bigint, integer) to aut
 -- insert into public.dev_users (user_id, note)
 -- select id, 'owner' from auth.users where email = 'your@email.com'
 -- on conflict (user_id) do nothing;
+
+-- 08.8 Every column the BOT WRITES must exist (expect zero rows).
+--      prefix_enabled was missing for the whole life of the project: the bot
+--      wrote it, no schema file created it, and the failure looked like "the
+--      toggle does nothing". This compares the live table against the columns
+--      the bot actually uses, so a future rename drops out here instead of in
+--      production. Update the list when a new column is added.
+-- select missing.column_name
+--   from (values
+--           ('prefix'),('prefix_enabled'),('log_channel_id'),('log_enabled'),
+--           ('log_categories'),('ai_enabled'),('ai_model'),('ai_system_prompt'),
+--           ('ai_max_tokens'),('ai_temperature'),('ai_context_messages'),
+--           ('ai_memory_enabled'),('ai_memory_days'),
+--           ('ai_memory_ignored_channels'),('ai_user_cooldown_seconds'),
+--           ('ai_all_channels'),('ai_channel_ids'),('qotd_enabled'),
+--           ('qotd_channel_id'),('qotd_role_id'),('qotd_time'),('qotd_timezone'),
+--           ('qotd_days'),('qotd_empty_queue_notice'),('qotd_last_fired_at')
+--        ) as missing(column_name)
+--  where not exists (
+--        select 1 from information_schema.columns
+--         where table_schema = 'public'
+--           and table_name = 'guild_settings'
+--           and columns.column_name = missing.column_name
+--  );
+
+-- 08.9 qotd_empty_queue_notice should stay false unless an admin asked for it
+-- select guild_id, qotd_empty_queue_notice from public.guild_settings
+--  where qotd_empty_queue_notice;
 
 -- ============================================================================
 -- END OF SCHEMA
