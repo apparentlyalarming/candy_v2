@@ -123,7 +123,12 @@ class ConfigCog(commands.Cog, name="Config"):
             f"Channels: {channels_text}",
             f"Temperature: {cfg.ai_temperature}  •  context: {cfg.ai_context_messages} messages",
             f"Memory: {'on' if cfg.ai_memory_enabled else 'off'}"
-            + ("" if cfg.ai_memory_enabled else " (nothing read or saved)"),
+            + (
+                f"  •  window: {cfg.ai_memory_days or 'forever'} day(s)"
+                if cfg.ai_memory_enabled
+                else " (nothing read or saved)"
+            ),
+            f"Memory ignored in: {', '.join(f'<#{c}>' for c in cfg.ai_memory_ignored_channels) or 'no channels'}",
             f"Cooldown: {cfg.ai_user_cooldown_seconds}s per user",
             "",
             "**Question of the Day**",
@@ -249,10 +254,7 @@ class ConfigCog(commands.Cog, name="Config"):
             f"AI chat is now **{'enabled' if enabled else 'disabled'}**.{suffix}",
         )
 
-    @chat_group.command(
-        name="memory",
-        description="Let the AI remember this server (on), or forget (off).",
-    )
+    @chat_group.command(name="memory", description="Let the AI remember this server (on), or forget (off).")
     @app_commands.describe(
         enabled="On: the AI recalls past chat. Off: it reads and saves nothing."
     )
@@ -264,13 +266,13 @@ class ConfigCog(commands.Cog, name="Config"):
         # to assume their history was erased.
         if enabled:
             note = (
-                "The AI will recall earlier messages in each channel again. "
-                "Previously stored summaries were kept, so that context is back."
+                "The AI will recall earlier messages again. "
+                "Previously stored history was kept, so that context is back."
             )
         else:
             note = (
                 "The AI will stop recalling past chat **and** stop saving new "
-                "summaries. Nothing already stored was deleted, so turning it "
+                "messages. Nothing already stored was deleted, so turning it "
                 "back on restores the previous context."
             )
         await self._apply(
@@ -278,6 +280,76 @@ class ConfigCog(commands.Cog, name="Config"):
             lambda gid: self.config.set_ai_memory_enabled(gid, enabled),
             f"Memory is now **{'on' if enabled else 'off'}**. {note}",
         )
+
+    @chat_group.command(
+        name="memorydays",
+        description="How many days of chat the AI remembers. 0 = forever.",
+    )
+    @app_commands.describe(days="0-3650. Each message expires on its own Nth day; nothing is ever wiped wholesale.")
+    async def chat_memory_days(self, interaction: discord.Interaction, days: int) -> None:
+        if days == 0:
+            note = "The AI will keep its memory indefinitely."
+        else:
+            note = (
+                f"Messages older than **{days} days** are deleted as new ones "
+                "arrive. Each one expires on its own day - the whole history is "
+                "never cleared at once."
+            )
+        await self._apply(
+            interaction,
+            lambda gid: self.config.set_ai_memory_days(gid, days),
+            f"Memory window set to **{days}** day(s). {note}",
+        )
+
+    @chat_group.command(
+        name="memorychannels",
+        description="Channels the AI must never remember or recall.",
+    )
+    @app_commands.describe(
+        channel="Channel to add or remove.",
+        action="Defaults to add.",
+    )
+    @app_commands.choices(
+        action=[
+            app_commands.Choice(name="add (stop remembering here)", value="add"),
+            app_commands.Choice(name="remove (remember here again)", value="remove"),
+            app_commands.Choice(name="clear", value="clear"),
+        ]
+    )
+    async def chat_memory_channels(
+        self,
+        interaction: discord.Interaction,
+        action: app_commands.Choice[str],
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        if action.value in {"add", "remove"} and channel is None:
+            await interaction.response.send_message(
+                f"Pick a channel to `{action.value}`.", ephemeral=True
+            )
+            return
+
+        gid = interaction.guild_id
+        try:
+            if action.value == "add":
+                await _to_thread(self.config.add_ai_memory_ignored_channel, gid, channel.id)
+                message = (
+                    f"{channel.mention} is now **ignored**: nothing said there is "
+                    "remembered or recalled."
+                )
+            elif action.value == "remove":
+                await _to_thread(self.config.remove_ai_memory_ignored_channel, gid, channel.id)
+                message = f"{channel.mention} is remembered again."
+            else:
+                await _to_thread(self.config.set_ai_memory_ignored_channels, gid, [])
+                message = "Ignored-channel list cleared - every channel is remembered."
+        except ConfigError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        await interaction.response.send_message(message, ephemeral=True)
 
     @chat_group.command(name="model", description="Choose the AI model.")
     @app_commands.choices(model=MODEL_CHOICES)

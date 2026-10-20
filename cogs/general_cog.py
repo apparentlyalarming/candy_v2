@@ -51,7 +51,13 @@ class GeneralCog(commands.Cog, name="General"):
 
         embed.add_field(
             name="💬 General",
-            value="`/hello` - say hi to me\n`/help` - show this menu\n`/ask` - ask me anything",
+            value=(
+                "`/hello` - say hi to me\n"
+                "`/help` - show this menu\n"
+                "`/ask` - ask me anything\n"
+                "`@Candy` or `!candy` - chat with me\n"
+                "`!candyp` - same, but I weigh your own history too"
+            ),
             inline=False,
         )
 
@@ -185,6 +191,15 @@ class GeneralCog(commands.Cog, name="General"):
 
             body = content[len(prefix):].strip().lower()
 
+            # Chat prefix commands. `!candyp` MUST be checked before `!candy`:
+            # a plain prefix match would let `!candy` swallow `!candyp` and the
+            # personalized path would be unreachable. The word split is what makes
+            # the check a boundary test rather than a startswith.
+            chat_head = body.split(maxsplit=1)[0] if body else ""
+            if chat_head in {"candy", "candyp"}:
+                await self._handle_chat_prefix(message, content, body, prefix, chat_head)
+                return
+
             # !memory on / !memory off - admin only, since it changes guild
             # config. Checked BEFORE the hello fallback so it is not shadowed.
             if body.split()[0:1] == ["memory"]:
@@ -195,6 +210,56 @@ class GeneralCog(commands.Cog, name="General"):
                 await message.reply(f"Hello, {message.author.mention}! 🍬", mention_author=False)
         except Exception as exc:  # noqa: BLE001
             log.error("on_message dispatcher failed: %s", exc, exc_info=True)
+
+    async def _handle_chat_prefix(
+        self,
+        message: discord.Message,
+        content: str,
+        body: str,
+        prefix: str,
+        head: str,
+    ) -> None:
+        """Route ``!candy`` and ``!candyp`` to the AI cog.
+
+        The prompt is the ORIGINAL text after the command word (not the lowercased
+        ``body``), so the user's casing survives. ``head`` selects the variant:
+        ``candyp`` asks the AI cog to add the prompter's own history.
+
+        The prefix is configurable, so the command word is taken from the actual
+        message rather than hardcoded. The offset is measured against the
+        WHITESPACE-STRIPPED remainder, not the raw message, so "!  candy hi" (extra
+        spaces after the prefix) still yields the prompt "hi" rather than a mangled
+        slice.
+        """
+        ai_cog = self.bot.get_cog("AI")
+        if ai_cog is None:
+            return
+
+        # Strip "<prefix><head>" from the original text, leaving the prompt. Work
+        # from the position of the command word in the raw content so the user's
+        # casing is preserved.
+        after_prefix = content[len(prefix):]
+        stripped = after_prefix.lstrip()
+        prompt = stripped[len(head):].strip()
+
+        personalized = head == "candyp"
+        handled = await ai_cog.handle_chat(message, prompt, personalized=personalized)  # type: ignore[attr-defined]
+        if not handled:
+            # The AI declined (disabled, or channel not allowed). Say so instead of
+            # looking broken - silence here reads as "!candy does nothing".
+            config = self.config.get(message.guild.id) if message.guild else None
+            if config is not None and not config.ai_enabled:
+                await message.reply(
+                    "AI chat is disabled here. An admin can enable it with "
+                    "`/config chat toggle`.",
+                    mention_author=False,
+                )
+            elif config is not None and not config.ai_allowed_in(message.channel.id):
+                await message.reply(
+                    "I'm not set up to chat in this channel. An admin can add it "
+                    "with `/config chat channels`.",
+                    mention_author=False,
+                )
 
     async def _handle_memory_prefix(
         self, message: discord.Message, body: str, prefix: str

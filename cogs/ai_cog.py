@@ -1,12 +1,14 @@
-"""AI chat: /ask, mention handling, and the fallback tells the user why.
+"""AI chat: /ask, mentions, and the prefix chat commands.
 
 The Groq key lives in Supabase secrets behind the `chat` Edge Function, so this
 cog never sees a provider key. If the function is misconfigured or the AI is rate
 limited, the user gets a clear, in-character message instead of a stack trace.
 
-Every successful exchange is recorded as a one-line SUMMARY in ai_interactions
-(never the full text) so the bot can recall context and admins can see usage
-stats without reading anyone's messages.
+Two independent records are kept per exchange:
+  - ai_interactions: a one-line SUMMARY, for dashboard usage stats. No message
+    text, ever.
+  - ai_memory: the REAL prompt and reply, so memory survives a restart. Retrieval
+    is global per guild (all channels share one pool).
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from discord.ext import commands
 from db import config_cache
 from services.config_service import ConfigService
 from services.groq_service import (
+    ChatMessage,
     ChatResult,
     GroqError,
     GroqRateLimited,
@@ -32,9 +35,14 @@ log = get_logger("cogs.ai")
 
 MAX_PROMPT_LENGTH = 1500
 
-# How many summaries are kept per channel before trimming. Must match the
-# default in ai_trim_channel() (migration_002_logging.sql).
-MEMORY_WINDOW = 50
+# How many messages of a guild's history are reloaded from the database when the
+# guild is first used after a restart. Matches the in-RAM window closely enough
+# that a restart is invisible to the user.
+HYDRATE_MESSAGES = 20
+
+# How many of the prompter's OWN turns are added for the personalized (!candyp)
+# path. Five exchanges = ten messages, in parallel with the channel window.
+PERSONAL_MESSAGES = 10
 
 # Shown when the AI is unavailable. Deliberately short and never a stack trace.
 FALLBACK_MESSAGE = "My brain is offline right now - try again in a moment."
@@ -99,6 +107,7 @@ class AiCog(commands.Cog, name="AI"):
                 max_tokens=config.ai_max_tokens,
                 temperature=config.ai_temperature,
                 cooldown_seconds=config.ai_user_cooldown_seconds,
+                hydrate=self._make_hydrate(interaction.guild_id, config),
             )
         except GroqRateLimited as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
@@ -157,6 +166,7 @@ class AiCog(commands.Cog, name="AI"):
                 max_tokens=config.ai_max_tokens,
                 temperature=config.ai_temperature,
                 cooldown_seconds=config.ai_user_cooldown_seconds,
+                hydrate=self._make_hydrate(message.guild.id, config),
             )
         except GroqRateLimited as exc:
             await message.reply(str(exc), mention_author=False)
@@ -177,11 +187,117 @@ class AiCog(commands.Cog, name="AI"):
         )
         return True
 
-    async def reset_context(self, channel_id: int) -> None:
+    # --- prefix chat (!candy / !candyp) ------------------------------------
+
+    async def handle_chat(
+        self, message: discord.Message, prompt: str, *, personalized: bool
+    ) -> bool:
+        """Reply to a prefix chat command. Returns True when a reply was attempted.
+
+        ``personalized`` adds the prompter's own recent turns on top of the shared
+        server memory (that is the whole difference between !candy and !candyp).
+        The channel allow-list and the per-channel memory ignore list are honoured
+        exactly as they are for a mention.
+        """
+        if message.guild is None or self.groq is None:
+            return False
+
+        if not prompt:
+            await message.reply(
+                "You rang? Ask me something, or use `/ask`. 🍬", mention_author=False
+            )
+            return True
+
+        if len(prompt) > MAX_PROMPT_LENGTH:
+            await message.reply(
+                f"That prompt is too long (max {MAX_PROMPT_LENGTH} characters).",
+                mention_author=False,
+            )
+            return True
+
+        config = config_cache.get(message.guild.id)
+        channel_id = message.channel.id if message.channel else 0
+
+        if not config.ai_allowed_in(channel_id):
+            return False
+
+        await message.channel.typing()
+
+        try:
+            result = await self.groq.respond_to_command(
+                guild_id=message.guild.id,
+                channel_id=channel_id,
+                user_id=message.author.id,
+                user_name=message.author.display_name,
+                prompt=prompt,
+                context_messages=self._context_count(config),
+                system_prompt=config.ai_system_prompt,
+                model=config.ai_model,
+                max_tokens=config.ai_max_tokens,
+                temperature=config.ai_temperature,
+                cooldown_seconds=config.ai_user_cooldown_seconds,
+                personalize_user_id=message.author.id if personalized else None,
+                hydrate=self._make_hydrate(message.guild.id, config),
+            )
+        except GroqRateLimited as exc:
+            await message.reply(str(exc), mention_author=False)
+            return True
+        except (GroqUnavailable, GroqError) as exc:
+            log.error("AI prefix chat failed: %s", exc, exc_info=True)
+            await self._log_failure(message.guild.id, channel_id, exc)
+            await message.reply(FALLBACK_MESSAGE, mention_author=False)
+            return True
+
+        await message.reply(self._trim(result.reply), mention_author=False)
+        await self._remember(
+            guild_id=message.guild.id,
+            channel_id=channel_id,
+            user_id=message.author.id,
+            user_name=message.author.display_name,
+            result=result,
+        )
+        return True
+
+    async def reset_context(self, guild_id: int) -> None:
         if self.groq is not None:
-            self.groq.reset_channel(channel_id)
+            self.groq.reset_guild(guild_id)
 
     # --- helpers -----------------------------------------------------------
+
+    def _make_hydrate(self, guild_id: int, config):
+        """Build the async loader that refills history from the database.
+
+        Returns None when memory is off, so nothing is read - the toggle means
+        "neither read nor write". The loader is called at most once per guild per
+        process (see GroqService._hydrate). When invoked with
+        ``discord_user_id`` it serves the personalized slice instead.
+        """
+        if self.config is None or not config.ai_memory_enabled:
+            return None
+
+        limit = max(0, config.ai_context_effective) or HYDRATE_MESSAGES
+
+        async def _loader(discord_user_id: int | None = None) -> list:
+            wanted = PERSONAL_MESSAGES if discord_user_id is not None else limit
+            rows = await asyncio.to_thread(
+                self.config.load_memory,
+                guild_id,
+                limit=wanted,
+                discord_user_id=discord_user_id,
+            )
+            messages = []
+            for row in rows:
+                prompt = str(row.get("user_content") or "").strip()
+                reply = str(row.get("assistant_content") or "").strip()
+                if not prompt or not reply:
+                    continue
+                author = str(row.get("user_display_name") or "").strip()
+                label = f"{author}: {prompt}" if author else prompt
+                messages.append(ChatMessage("user", label))
+                messages.append(ChatMessage("assistant", reply))
+            return messages
+
+        return _loader
 
     async def _remember(
         self,
@@ -192,22 +308,27 @@ class AiCog(commands.Cog, name="AI"):
         user_name: str,
         result: ChatResult,
     ) -> None:
-        """Persist the summary and trim the channel window. Never raises.
+        """Persist the exchange and prune by age. Never raises.
 
-        Trimming runs on the same pass so storage stays bounded without a
-        scheduled job: we write one row, then keep only the newest window.
+        Writes TWO independent records:
+          - the analytics SUMMARY (ai_interactions), unchanged;
+          - the REAL prompt + reply (ai_memory), which is what survives a restart.
 
-        Gated on the guild's memory flag. When memory is off nothing is written,
-        so a channel that is opted out leaves no trace beyond the reply itself.
-        The check lives here rather than at each call site so a future caller
-        cannot forget it.
+        Pruning runs on the same pass so retention needs no scheduled job: we
+        insert one turn, then delete anything older than the guild's window.
+
+        Gated on the guild's memory flag AND the per-channel ignore list. When
+        either says no, nothing is written and nothing is read.
         """
         if guild_id is None or self.config is None:
             return
 
         config = config_cache.get(guild_id)
         if not config.ai_memory_enabled:
-            log.debug("Memory disabled for guild %s; not recording AI summary", guild_id)
+            log.debug("Memory disabled for guild %s; not recording AI exchange", guild_id)
+            return
+        if channel_id and config.ai_memory_ignores(channel_id):
+            log.debug("Channel %s ignored for guild %s; not recording", channel_id, guild_id)
             return
 
         def _work() -> None:
@@ -218,8 +339,15 @@ class AiCog(commands.Cog, name="AI"):
                 user_display_name=user_name,
                 result=result,
             )
-            if channel_id:
-                self.config.trim_ai_channel(guild_id, channel_id, MEMORY_WINDOW)
+            self.config.record_memory_turn(
+                guild_id=guild_id,
+                channel_id=channel_id,
+                user_id=user_id,
+                user_display_name=user_name,
+                user_content=result.prompt,
+                assistant_content=result.reply,
+            )
+            self.config.prune_ai_memory(guild_id, config.ai_memory_days)
 
         try:
             await asyncio.to_thread(_work)

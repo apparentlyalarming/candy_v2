@@ -33,8 +33,14 @@ AI_MAX_TOKENS_MIN = 1
 AI_MAX_TOKENS_MAX = 8192
 AI_CONTEXT_MIN = 0
 AI_CONTEXT_MAX = 50
+AI_MEMORY_DAYS_MIN = 0
+AI_MEMORY_DAYS_MAX = 3650
 COOLDOWN_MIN = 0
 COOLDOWN_MAX = 3600
+
+# Per-turn text cap. Stops one huge paste from bloating a stored exchange; the
+# window is a memory, not an archive.
+MEMORY_TURN_MAX_CHARS = 2000
 QOTD_DAYS_VALID = {1, 2, 3, 4, 5, 6, 7}
 
 
@@ -184,7 +190,9 @@ class ConfigService:
 
         Called after a successful reply. Failures are logged and swallowed: the
         user already has their answer, so a bookkeeping error must not surface.
-        Storage is bounded separately by :meth:`trim_ai_channel`.
+
+        This is the ANALYTICS record (counts/tokens/latency and a one-line gist).
+        The restart-safe conversation store is :meth:`record_memory_turn`.
         """
         gid = to_id(guild_id)
         if gid is None:
@@ -213,7 +221,13 @@ class ConfigService:
             log.debug("Could not record ai_interaction: %s", exc)
 
     def trim_ai_channel(self, guild_id: int, channel_id: int, keep: int = 50) -> int:
-        """Keep only the newest ``keep`` summaries for a channel. Returns deleted count."""
+        """Keep only the newest ``keep`` summaries for a channel. Returns deleted count.
+
+        LEGACY (migration_002): superseded by :meth:`prune_ai_memory`, which ages
+        out the real conversation store by the guild's ``ai_memory_days`` window.
+        Retained because ``ai_trim_channel()`` still exists in the database and the
+        dashboard contract references it; nothing in the bot calls it any more.
+        """
         gid = to_id(guild_id)
         cid = to_id(channel_id)
         if gid is None or cid is None:
@@ -266,13 +280,141 @@ class ConfigService:
         self._update_settings(guild_id, {"ai_context_messages": int(value)})
 
     def set_ai_memory_enabled(self, guild_id: int, enabled: bool) -> None:
-        """Turn per-channel memory on or off.
+        """Turn per-server memory on or off.
 
-        Off means the AI neither reads past summaries nor writes new ones.
-        Existing ai_interactions rows are deliberately NOT deleted, so turning it
-        back on restores prior context. Read depth is preserved separately.
+        Off means the AI neither reads past turns nor writes new ones. Existing
+        ai_memory rows are deliberately NOT deleted, so turning it back on
+        restores prior context. Read depth is preserved separately.
         """
         self._update_settings(guild_id, {"ai_memory_enabled": bool(enabled)})
+
+    def set_ai_memory_days(self, guild_id: int, days: int) -> None:
+        """Set the per-row retention window in days. 0 = keep forever.
+
+        Per-row expiry: each stored turn dies on its own Nth birthday. There is
+        no whole-table wipe at any point.
+        """
+        _check_range("memory days", days, AI_MEMORY_DAYS_MIN, AI_MEMORY_DAYS_MAX)
+        self._update_settings(guild_id, {"ai_memory_days": int(days)})
+
+    def set_ai_memory_ignored_channels(
+        self, guild_id: int, channel_ids: Iterable[Any] | None
+    ) -> None:
+        """Replace the set of channels excluded from memory."""
+        resolved = to_id_list(channel_ids or [])
+        self._update_settings(guild_id, {"ai_memory_ignored_channels": resolved})
+
+    def add_ai_memory_ignored_channel(self, guild_id: int, channel_id: Any) -> None:
+        current = set(self.get(guild_id).ai_memory_ignored_channels)
+        target = to_id(channel_id)
+        if target is None:
+            raise ConfigError("invalid channel id")
+        current.add(target)
+        self.set_ai_memory_ignored_channels(guild_id, current)
+
+    def remove_ai_memory_ignored_channel(self, guild_id: int, channel_id: Any) -> None:
+        current = set(self.get(guild_id).ai_memory_ignored_channels)
+        target = to_id(channel_id)
+        current.discard(target)
+        self.set_ai_memory_ignored_channels(guild_id, current)
+
+    # --- memory turns (the restart-safe store) -------------------------
+
+    def record_memory_turn(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int | None,
+        user_id: int | None,
+        user_display_name: str | None,
+        user_content: str,
+        assistant_content: str,
+    ) -> None:
+        """Persist one real exchange (prompt + reply) for restart-safe memory.
+
+        Both halves are required: a reply with no prompt cannot be replayed into
+        a conversation. Best-effort - the user already has their answer, so a
+        bookkeeping failure must not surface.
+        """
+        gid = to_id(guild_id)
+        if gid is None:
+            return
+
+        prompt = (user_content or "").strip()
+        reply = (assistant_content or "").strip()
+        if not prompt or not reply:
+            return
+
+        row: dict[str, Any] = {
+            "guild_id": gid,
+            "channel_id": to_id(channel_id),
+            "discord_user_id": to_id(user_id),
+            "user_display_name": (user_display_name or None),
+            "user_content": prompt[:MEMORY_TURN_MAX_CHARS],
+            "assistant_content": reply[:MEMORY_TURN_MAX_CHARS],
+            # user_id (the auth.users uuid) is left NULL on purpose: the bot knows
+            # the Discord id, not the linked Supabase account.
+        }
+
+        try:
+            supabase_client.insert("ai_memory", row)
+        except Exception as exc:  # noqa: BLE001 - memory is best-effort
+            log.debug("Could not record ai_memory turn: %s", exc)
+
+    def load_memory(
+        self, guild_id: int, *, limit: int, discord_user_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Newest ``limit`` memory turns for a guild, oldest-first for replay.
+
+        Filtered on guild_id only: memory is global per server, not per channel.
+        When ``discord_user_id`` is given, rows are restricted to that author
+        (the personalized path). Returns [] on any failure - memory is optional.
+        """
+        gid = to_id(guild_id)
+        if gid is None or limit <= 0:
+            return []
+
+        filters: dict[str, Any] = {"guild_id": gid}
+        uid = to_id(discord_user_id)
+        if uid is not None:
+            filters["discord_user_id"] = uid
+
+        try:
+            rows = supabase_client.select(
+                "ai_memory",
+                "user_content,assistant_content,discord_user_id,created_at",
+                filters=filters,
+                order_by="created_at.desc",
+                limit=int(limit),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("load_memory failed: %s", exc)
+            return []
+
+        # Query returned newest-first; the prompt wants chronological order.
+        return list(reversed(rows))
+
+    def prune_ai_memory(self, guild_id: int, keep_days: int) -> int:
+        """Delete this guild's turns older than ``keep_days``. Returns count.
+
+        Runs on the same write pass as the insert, exactly like the old
+        ai_trim_channel helper, so retention needs no scheduled job. A no-op when
+        ``keep_days`` <= 0 (keep forever).
+        """
+        gid = to_id(guild_id)
+        if gid is None or keep_days <= 0:
+            return 0
+        try:
+            return int(
+                supabase_client.call_rpc(
+                    "ai_memory_prune",
+                    {"p_guild_id": gid, "p_keep_days": max(1, int(keep_days))},
+                )
+                or 0
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("ai_memory_prune failed: %s", exc)
+            return 0
 
     def set_ai_cooldown(self, guild_id: int, seconds: int) -> None:
         _check_range("cooldown", seconds, COOLDOWN_MIN, COOLDOWN_MAX)

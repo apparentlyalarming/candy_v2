@@ -33,10 +33,15 @@ REQUEST_TIMEOUT_SECONDS = 45.0
 MAX_RETRIES = 2
 RETRY_BACKOFF_SECONDS = 1.5
 
-# How many messages total are retained per channel before trimming. The guild's
+# How many messages total are retained per GUILD in RAM. The guild's
 # ai_context_messages controls how many are *sent*; this caps how many we *keep*
-# in memory so a busy channel cannot grow the deque without bound.
-MAX_RETAINED_MESSAGES = 50
+# in memory so a busy server cannot grow the deque without bound. Memory is
+# global per server, so this is one window for the whole guild.
+MAX_RETAINED_MESSAGES = 100
+
+# How many messages are reloaded from the database when a guild is first seen
+# after a restart. Bounded so hydration is a single small query.
+HYDRATE_MESSAGES = 20
 
 
 class GroqError(RuntimeError):
@@ -68,9 +73,10 @@ class ChatMessage:
 class ChatResult:
     """Everything the Edge Function hands back for one exchange.
 
-    ``reply`` is what the user sees. ``summary`` is the one-line gist stored as
-    memory; it is what future calls recall, which is why it is carried separately
-    rather than re-derived from the reply text.
+    ``reply`` is what the user sees. ``summary`` is the one-line gist stored for
+    analytics in ``ai_interactions``. ``prompt`` is carried so the caller can
+    persist the real exchange to ``ai_memory`` - a reply with no prompt cannot be
+    replayed into a conversation, which is why the two are stored together.
     """
 
     reply: str
@@ -81,11 +87,18 @@ class ChatResult:
     completion_tokens: int = 0
     latency_ms: int = 0
 
+    # The user prompt this reply answers. Carried so the caller can persist the
+    # real exchange to ai_memory: a reply with no prompt cannot be replayed.
+    prompt: str = ""
+    user_name: str = ""
+
     def as_row(self) -> dict[str, Any]:
         """Shape this result into an ``ai_interactions`` insert payload.
 
-        Deliberately excludes the full reply text: only the summary is retained
-        (see migration_002_logging.sql). Returns an empty dict when there is no
+        This is the ANALYTICS row: it deliberately excludes the reply text, since
+        this table exists for usage stats and carries no message content. The
+        restart-safe conversation store is ``ai_memory`` (see
+        ConfigService.record_memory_turn). Returns an empty dict when there is no
         summary worth storing.
         """
         if not self.summary:
@@ -102,25 +115,37 @@ class ChatResult:
 
 @dataclass
 class _ChannelState:
-    """Per-channel conversation history and in-flight request tracking."""
+    """Per-guild conversation history and in-flight request tracking.
+
+    Named for history but keyed by GUILD: memory is global per server, so the
+    whole guild shares one rolling window. (The field kept its old name to avoid
+    a noisy rename; ``self._channels`` is a guild map.)
+    """
 
     history: deque[ChatMessage] = field(
         default_factory=lambda: deque(maxlen=MAX_RETAINED_MESSAGES)
     )
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    hydrated: bool = False
 
 
 class GroqService:
-    """Talks to the AI backend and owns per-channel conversation state.
+    """Talks to the AI backend and owns per-guild conversation state.
 
     Two entry points, deliberately kept separate so they cannot be confused:
       - :meth:`respond_to_mention`   the bot was @mentioned
-      - :meth:`respond_to_command`   the /ask slash command
+      - :meth:`respond_to_command`   the /ask slash command, !candy, !candyp
+
+    MEMORY IS GLOBAL PER SERVER. History is keyed by guild, not channel, so the
+    assistant recalls the whole server the way a person recalls a room. On the
+    first request after a restart the guild's history is hydrated from the
+    database via the ``hydrate`` callback supplied by the caller.
     """
 
     def __init__(self, *, supabase_url: str, service_key: str) -> None:
         self._endpoint = f"{supabase_url.rstrip('/')}/functions/v1/chat"
         self._service_key = service_key
+        # guild_id -> per-guild conversation state (see _ChannelState)
         self._channels: dict[int, _ChannelState] = {}
         # (guild_id, user_id) -> monotonic timestamp of last AI reply
         self._user_cooldowns: dict[tuple[int, int], float] = {}
@@ -130,7 +155,7 @@ class GroqService:
     # --- lifecycle ---------------------------------------------------------
 
     async def aclose(self) -> None:
-        """Release per-channel state. Called on graceful shutdown."""
+        """Release per-guild state. Called on graceful shutdown."""
         self._channels.clear()
         self._user_cooldowns.clear()
         self._guild_last_call.clear()
@@ -151,6 +176,8 @@ class GroqService:
         max_tokens: int,
         temperature: float,
         cooldown_seconds: int,
+        personalize_user_id: int | None = None,
+        hydrate: Any = None,
     ) -> ChatResult:
         """Generate a reply to a message that mentioned the bot."""
         self._enforce_cooldown(guild_id, user_id, cooldown_seconds)
@@ -165,6 +192,8 @@ class GroqService:
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
+            personalize_user_id=personalize_user_id,
+            hydrate=hydrate,
         )
 
     async def respond_to_command(
@@ -181,8 +210,10 @@ class GroqService:
         max_tokens: int,
         temperature: float,
         cooldown_seconds: int,
+        personalize_user_id: int | None = None,
+        hydrate: Any = None,
     ) -> ChatResult:
-        """Generate a reply to /ask."""
+        """Generate a reply to /ask, !candy, or !candyp."""
         self._enforce_cooldown(guild_id, user_id, cooldown_seconds)
         return await self._complete(
             guild_id=guild_id,
@@ -195,6 +226,8 @@ class GroqService:
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
+            personalize_user_id=personalize_user_id,
+            hydrate=hydrate,
         )
 
     def remaining_cooldown(self, guild_id: int, user_id: int, cooldown_seconds: int) -> float:
@@ -208,24 +241,71 @@ class GroqService:
         elapsed = loop.time() - last
         return max(0.0, cooldown_seconds - elapsed)
 
-    def reset_channel(self, channel_id: int) -> None:
-        """Forget conversation history for a channel (used by /ask reset)."""
-        state = self._channels.get(channel_id)
+    def reset_guild(self, guild_id: int) -> None:
+        """Forget conversation history for a guild. Marks it un-hydrated so the
+        next request reloads from the database."""
+        state = self._channels.get(guild_id)
         if state is not None:
             state.history.clear()
+            state.hydrated = False
 
-    def history_length(self, channel_id: int) -> int:
-        state = self._channels.get(channel_id)
+    def history_length(self, guild_id: int) -> int:
+        state = self._channels.get(guild_id)
         return len(state.history) if state else 0
 
     # --- internals ---------------------------------------------------------
 
-    def _state(self, channel_id: int) -> _ChannelState:
-        state = self._channels.get(channel_id)
+    def _state(self, guild_id: int) -> _ChannelState:
+        state = self._channels.get(guild_id)
         if state is None:
             state = _ChannelState()
-            self._channels[channel_id] = state
+            self._channels[guild_id] = state
         return state
+
+    async def _hydrate(self, state: _ChannelState, hydrate: Any) -> None:
+        """Fill an empty guild history from the database, once per process.
+
+        ``hydrate`` is an async callable supplied by the caller that returns a
+        list of ChatMessage. Called lazily so a 256 MB host never preloads every
+        guild at startup. A failure leaves ``hydrated`` False so a later request
+        retries rather than starting permanently amnesiac.
+        """
+        if state.hydrated or hydrate is None:
+            return
+        if state.history:
+            # Already has turns from this process; DB rows would be older.
+            state.hydrated = True
+            return
+        try:
+            restored = await hydrate()
+        except Exception as exc:  # noqa: BLE001 - memory is best-effort
+            log.debug("History hydration failed: %s", exc)
+            return
+        for message in restored or []:
+            state.history.append(message)
+        state.hydrated = True
+        if restored:
+            log.info("Hydrated %d message(s) of AI history from the database", len(restored))
+
+    async def _personal_history(
+        self, hydrate: Any, user_id: int
+    ) -> list[ChatMessage]:
+        """This user's own recent turns, for the personalized (!candyp) path.
+
+        The caller's ``hydrate`` callable accepts a ``discord_user_id`` keyword
+        when it can serve a per-user slice; callers that cannot simply ignore it.
+        Best-effort: any failure yields no personal context rather than an error.
+        """
+        try:
+            try:
+                restored = await hydrate(discord_user_id=user_id)
+            except TypeError:
+                # Callable does not support the per-user slice.
+                return []
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Personal history load failed: %s", exc)
+            return []
+        return list(restored or [])
 
     def _enforce_cooldown(self, guild_id: int, user_id: int, cooldown_seconds: int) -> None:
         remaining = self.remaining_cooldown(guild_id, user_id, cooldown_seconds)
@@ -248,23 +328,48 @@ class GroqService:
         model: str,
         max_tokens: int,
         temperature: float,
+        personalize_user_id: int | None = None,
+        hydrate: Any = None,
         max_retries: int = MAX_RETRIES,
     ) -> ChatResult:
         """Call the Edge Function, retrying transient failures.
 
-        One in-flight request per channel is enforced with a lock so two fast
+        One in-flight request per guild is enforced with a lock so two fast
         messages cannot interleave into a single mangled reply.
         """
         if not self._service_key or not self._endpoint.startswith("http"):
             raise GroqUnavailable("AI backend is not configured (missing Supabase credentials)")
 
-        state = self._state(channel_id)
+        state = self._state(guild_id)
 
         async with state.lock:
+            # Reload from the database the first time this guild is used in this
+            # process, so a restart (every 4 days on the free host) does not wipe
+            # the assistant's memory.
+            await self._hydrate(state, hydrate)
+
             # Build the outgoing message list: system + trimmed history + prompt
             trimmed_history = list(state.history)[-max(0, context_messages):]
             messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
             messages.extend(m.as_dict() for m in trimmed_history)
+
+            # Personalized (!candyp): add this user's own recent turns on top of
+            # the shared server memory, so the assistant has extra context about
+            # whoever is asking. Best-effort - a failure just means a normal reply.
+            if personalize_user_id is not None and hydrate is not None:
+                personal = await self._personal_history(hydrate, personalize_user_id)
+                if personal:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                f"Recent things {user_name} specifically said and was "
+                                "told, for extra context on who is asking:"
+                            ),
+                        }
+                    )
+                    messages.extend(m.as_dict() for m in personal)
+
             messages.append({"role": "user", "content": f"{user_name}: {prompt}"})
 
             payload: dict[str, Any] = {
@@ -316,10 +421,12 @@ class GroqService:
                         raise GroqError("The AI returned an empty response.")
 
                     # Record the exchange only on success. We keep the REPLY in
-                    # the in-memory deque for immediate context, and hand the
-                    # SUMMARY to the caller so it can persist it to the database.
+                    # the in-memory deque for immediate context; the caller
+                    # persists the real turn (prompt + reply) to ai_memory.
                     state.history.append(ChatMessage("user", f"{user_name}: {prompt}"))
                     state.history.append(ChatMessage("assistant", result.reply))
+                    result.prompt = prompt
+                    result.user_name = user_name
 
                     loop = asyncio.get_event_loop()
                     self._user_cooldowns[(guild_id, user_id)] = loop.time()

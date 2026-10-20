@@ -36,10 +36,11 @@ pip install -r requirements.txt
 cp .env.example .env      # then fill in DISCORD_TOKEN, SUPABASE_URL, SUPABASE_SERVICE_KEY
 
 # 3. Create the database (run these IN ORDER in the Supabase SQL editor)
-#    schema.sql                  -> tables, RLS, QOTD queue functions
-#    seed_replies.sql            -> the fun action reply catalog
-#    migration_002_logging.sql   -> logging, AI memory, activity feed
-#    migration_003_ai_memory.sql -> AI memory on/off toggle
+#    schema.sql                    -> tables, RLS, QOTD queue functions
+#    seed_replies.sql              -> the fun action reply catalog
+#    migration_002_logging.sql     -> logging, AI stats, activity feed
+#    migration_003_ai_memory.sql   -> AI memory on/off toggle
+#    migration_004_ai_memory.sql   -> persistent memory (real turns) + retention
 #    (existing installs: only the migrations you have not run yet)
 
 # 4. Run
@@ -78,7 +79,7 @@ Everything is editable from **both** Discord and the dashboard. In Discord:
 |---|---|
 | `/config status` | Current server setup at a glance |
 | `/config general` | Prefix, prefix toggle, log channel, log events, log toggle |
-| `/config chat` | AI toggle, model, system prompt, channels, context, memory, cooldown, temperature, max tokens |
+| `/config chat` | AI toggle, model, system prompt, channels, context, memory, memory window, ignored channels, cooldown, temperature, max tokens |
 | `/config replies` | List, add, remove, toggle, reset fun action replies |
 | `/config qotd` | Toggle, time, timezone, channel, role, days, add, list, remove, next, skip |
 | `/config dev renewed` | Bot owner only. Resets the host-renewal reminder clock. |
@@ -94,6 +95,8 @@ concern, not a per-server setting.
 |---|---|
 | `/ask <prompt>` | Ask the AI. Also works on the dashboard. |
 | `@Candy <message>` | AI reply when the channel is allowed. |
+| `!candy <message>` | Same as a mention, as a prefix command. |
+| `!candyp <message>` | Personalized: also weighs the prompter's own recent history. |
 | `/hello`, `/help` | General. |
 | `/hug`, `/punch`, `/kick`, ... | Fun actions. Every one also works as `!hug`, etc. |
 
@@ -102,6 +105,10 @@ defaults, and a guild override takes precedence over the catalog default.
 
 Prefix commands are opt-out per guild and target the same code path as the slash
 equivalents.
+
+`!candyp` (the **p** is for **personalized**) is the same as `!candy` plus the
+prompter's own recent turns. `!candyp` is checked before `!candy` with a word
+boundary, so it can never be swallowed by its shorter sibling.
 
 ---
 
@@ -162,13 +169,65 @@ otherwise a host that restarts hourly would never reach the threshold.
 
 ## AI behaviour
 
-Each exchange asks the model for JSON: the user-facing `reply` and a one-line
-`summary`. Only the **summary** is stored (`ai_interactions`), never the full
-transcript — that keeps recall cheap, storage bounded, and user text minimal.
+Each exchange produces **two independent records**:
 
-Memory is a rolling window of the newest ~50 summaries **per channel**, trimmed
-as new ones arrive. Guild admins can see aggregate usage stats via
-`ai_stats_for_guild()`, which returns counts only and has no message-text column.
+| Table | Holds | Purpose |
+|---|---|---|
+| `ai_interactions` | a one-line **summary**, plus tokens and latency | dashboard usage stats. No message text, ever. |
+| `ai_memory` | the **real prompt and reply** | memory that survives a restart. |
+
+Memory is **global per server**: all channels share one pool, the way a person
+remembers a room. Retrieval filters on `guild_id`, not `channel_id` — the channel
+is stored on each row for the ignore list and for debugging, but it is not the
+lookup key.
+
+### Memory survives restarts
+
+The bot host restarts every 4 days for renewal. The in-RAM history window dies with
+the process, so on the first request after a restart the guild's recent turns are
+**reloaded from `ai_memory`** — lazily, only for the guild actually being used. A
+256 MB host must never preload every guild at startup.
+
+Both halves of each exchange are stored, not just the reply: a reply with no prompt
+cannot be replayed into a conversation. This also keeps token use flat, because the
+stored shape is exactly the shape the model already receives.
+
+> **Note on the original design.** The bot previously stored **no** message text
+> anywhere, and `ai_interactions` still does not. `ai_memory` deliberately reverses
+> that stance for this one table, because restart-safe continuity is impossible
+> without the actual words. Users' messages are now in the database.
+
+### Retention is a per-row window
+
+```
+ai_memory_days               # per guild, default 30; 0 = keep forever
+/config chat memorydays 30
+```
+
+Every stored turn has a `created_at`. Pruning deletes rows **older than the window**:
+
+```sql
+delete from ai_memory where guild_id = $1 and created_at < now() - interval '30 days';
+```
+
+**Each row expires on its own 30th birthday.** A row written today dies in 30 days;
+one written tomorrow dies in 31. The table is never cleared wholesale — there is no
+"reset after 30 days" event, only a rolling window. This is deliberate: a whole-table
+wipe would destroy today's conversations along with the old ones.
+
+Pruning runs **on the same write pass** as the insert (via `ai_memory_prune()`), so
+retention needs no scheduled job. Rows can only accumulate while the bot is up and
+being messaged, which is exactly when it can prune.
+
+### Per-channel opt-out
+
+A channel can be excluded from memory entirely — nothing said there is recorded or
+recalled:
+
+```
+/config chat memorychannels add #some-channel      # stop remembering here
+/config chat memorychannels remove #some-channel   # remember here again
+```
 
 ### Turning memory off
 
@@ -177,18 +236,17 @@ as new ones arrive. Guild admins can see aggregate usage stats via
 /config chat memory off  # slash equivalent
 ```
 
-Memory off means the AI **neither reads nor writes** summaries. It still answers,
-but every reply is made with no knowledge of the channel's history, and nothing
-new is recorded.
+Memory off means the AI **neither reads nor writes** anything. It still answers, but
+every reply is made with no knowledge of past chat, and nothing new is recorded.
 
-**Nothing already stored is deleted.** Turning memory back on restores the
-previous context immediately, and past usage stats survive. This is a deliberate
-choice: "off" is meant to be a switch, not a shredder.
+**Nothing already stored is deleted.** Turning memory back on restores the previous
+context immediately, and past usage stats survive. This is a deliberate choice:
+"off" is meant to be a switch, not a shredder.
 
 The flag is separate from `ai_context_messages`, because the two answer different
-questions — that one is *how many* past summaries to recall, this one is *whether
-to recall at all*. Read depth is left untouched while memory is off, so
-re-enabling restores the configured depth rather than resetting it to zero.
+questions — that one is *how many* past messages to recall, this one is *whether* to
+recall at all. Read depth is left untouched while memory is off, so re-enabling
+restores the configured depth rather than resetting it to zero.
 
 ---
 
@@ -199,8 +257,9 @@ main.py                   Entry point and startup order
 config.py                 Environment configuration
 schema.sql                Tables, RLS, QOTD queue functions   (run 1st)
 seed_replies.sql          Fun action reply catalog            (run 2nd)
-migration_002_logging.sql Logging, AI memory, activity feed   (run 3rd)
-migration_003_ai_memory.sql AI memory on/off toggle           (run 4th)
+migration_002_logging.sql Logging, AI stats, activity feed     (run 3rd)
+migration_003_ai_memory.sql AI memory on/off toggle            (run 4th)
+migration_004_ai_memory.sql Persistent memory + retention      (run 5th)
 
 db/                       Supabase client, config cache, Realtime listener
 services/                 Config writes, Groq client, rendering, QOTD scheduler,

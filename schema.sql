@@ -71,7 +71,9 @@ create table if not exists public.guild_settings (
     ai_max_tokens           integer not null default 512,
     ai_temperature          numeric(3,2) not null default 0.70,
     ai_context_messages     integer not null default 10,
-    ai_memory_enabled       boolean not null default true,   -- off = neither read nor write summaries
+    ai_memory_enabled       boolean not null default true,   -- off = neither read nor write memory
+    ai_memory_days          integer not null default 30,     -- per-row expiry window; 0 = keep forever
+    ai_memory_ignored_channels bigint[] not null default '{}', -- channels never recorded or recalled
     ai_user_cooldown_seconds integer not null default 5,
     ai_all_channels         boolean not null default false,
     ai_channel_ids          bigint[] not null default '{}',   -- empty = DISABLED (unless ai_all_channels)
@@ -95,6 +97,8 @@ create table if not exists public.guild_settings (
         check (ai_max_tokens > 0 and ai_max_tokens <= 8192),
     constraint guild_settings_ai_context_range
         check (ai_context_messages >= 0 and ai_context_messages <= 50),
+    constraint guild_settings_ai_memory_days_range
+        check (ai_memory_days >= 0 and ai_memory_days <= 3650),
     constraint guild_settings_cooldown_range
         check (ai_user_cooldown_seconds >= 0 and ai_user_cooldown_seconds <= 3600),
     constraint guild_settings_qotd_days_range
@@ -106,7 +110,11 @@ comment on table public.guild_settings is
 comment on column public.guild_settings.ai_channel_ids is
     'Channels where AI responds. Empty array = disabled (see ai_all_channels for everywhere).';
 comment on column public.guild_settings.ai_memory_enabled is
-    'When false the AI neither reads nor writes per-channel summaries. Existing rows are left untouched, so re-enabling restores prior context.';
+    'When false the AI neither reads nor writes memory. Existing rows are left untouched, so re-enabling restores prior context.';
+comment on column public.guild_settings.ai_memory_days is
+    'How many days of AI memory to keep, per row (each row expires on its own Nth birthday). 0 = keep forever. Default 30.';
+comment on column public.guild_settings.ai_memory_ignored_channels is
+    'Channels the AI neither records nor recalls. Per-channel escape hatch for channels where memory must stay off.';
 comment on column public.guild_settings.qotd_days is
     'Days of week QOTD fires: 1=Mon..7=Sun. Empty array = every day.';
 
@@ -182,6 +190,48 @@ comment on table public.qotd_questions is
     'QOTD FIFO queue. asked_at IS NULL = queued. Rows are marked asked, not deleted, so history survives.';
 
 
+-- ---------------------------------------------------------------------------
+-- ai_memory: real conversation turns for restart-safe AI memory
+-- ---------------------------------------------------------------------------
+-- ONE row per exchange, both halves NOT NULL. A reply with no prompt cannot be
+-- fed back into a conversation, so a half-row is a bug rather than something to
+-- tolerate.
+--
+-- GLOBAL PER GUILD: retrieval filters on guild_id, not channel_id. channel_id is
+-- kept for the per-channel ignore list and for debugging, but the bot recalls the
+-- whole server the way a person recalls a room.
+--
+-- This deliberately REVERSES the original no-transcripts stance (see
+-- migration_004_ai_memory.sql). ai_interactions still stores no message text;
+-- that table is analytics, this one is memory.
+
+create table if not exists public.ai_memory (
+    id                  bigserial primary key,
+    guild_id            bigint not null references public.guilds(id) on delete cascade,
+    channel_id          bigint,                     -- where it happened; NOT the lookup key
+    user_id             uuid references auth.users(id) on delete set null,
+    discord_user_id     bigint,                     -- the prompt author (drives !candyp)
+    user_display_name   text,
+
+    user_content        text not null,              -- what the user said
+    assistant_content   text not null,              -- what the bot replied
+
+    created_at          timestamptz not null default now(),
+
+    constraint ai_memory_user_content_not_blank
+        check (length(btrim(user_content)) > 0),
+    constraint ai_memory_assistant_content_not_blank
+        check (length(btrim(assistant_content)) > 0)
+);
+
+comment on table public.ai_memory is
+    'Real AI conversation turns (prompt + reply) for restart-safe memory. Global per guild: retrieval filters on guild_id. One row per exchange.';
+comment on column public.ai_memory.channel_id is
+    'Stored for the per-channel ignore list and for debugging. Retrieval is by guild_id, not this column.';
+comment on column public.ai_memory.user_content is
+    'The user prompt. Stored deliberately: a reply is uninterpretable without the prompt it answers.';
+
+
 -- ============================================================================
 -- 03  INDEXES
 -- ============================================================================
@@ -206,6 +256,17 @@ create index if not exists user_guilds_guild_idx
 -- Guild listing
 create index if not exists guilds_bot_present_idx
     on public.guilds (bot_present);
+
+-- AI memory: guild-scoped newest-first reads (the common query), per-person
+-- reads for !candyp, and the retention sweep by age.
+create index if not exists ai_memory_guild_created_idx
+    on public.ai_memory (guild_id, created_at desc);
+
+create index if not exists ai_memory_guild_user_created_idx
+    on public.ai_memory (guild_id, discord_user_id, created_at desc);
+
+create index if not exists ai_memory_created_idx
+    on public.ai_memory (created_at);
 
 
 -- ============================================================================
@@ -288,6 +349,7 @@ alter table public.user_guilds     enable row level security;
 alter table public.reply_actions   enable row level security;
 alter table public.guild_replies   enable row level security;
 alter table public.qotd_questions  enable row level security;
+alter table public.ai_memory       enable row level security;
 
 -- Belt and braces: also force RLS for table owners where applicable.
 alter table public.guilds          force row level security;
@@ -296,6 +358,7 @@ alter table public.user_guilds     force row level security;
 alter table public.reply_actions   force row level security;
 alter table public.guild_replies   force row level security;
 alter table public.qotd_questions  force row level security;
+alter table public.ai_memory       force row level security;
 
 -- ---------------------------------------------------------------------------
 -- guilds
@@ -421,6 +484,19 @@ drop policy if exists "qotd_delete_managed" on public.qotd_questions;
 create policy "qotd_delete_managed"
     on public.qotd_questions
     for delete
+    to authenticated
+    using (public.can_manage_guild(guild_id));
+
+-- ---------------------------------------------------------------------------
+-- ai_memory
+-- ---------------------------------------------------------------------------
+-- SELECT only, for guilds the caller manages. No insert/update/delete policy on
+-- purpose: memory is written and pruned by the bot alone, and a dashboard never
+-- edits a transcript.
+drop policy if exists "ai_memory_select_managed" on public.ai_memory;
+create policy "ai_memory_select_managed"
+    on public.ai_memory
+    for select
     to authenticated
     using (public.can_manage_guild(guild_id));
 
@@ -555,6 +631,56 @@ revoke all on function public.qotd_renumber(bigint) from public;
 grant execute on function public.qotd_add_question(bigint, text) to authenticated;
 grant execute on function public.qotd_move_question(bigint, bigint, integer) to authenticated;
 grant execute on function public.qotd_renumber(bigint) to authenticated;
+
+
+-- ============================================================================
+-- 05c  AI MEMORY RETENTION
+-- ============================================================================
+-- Called by the bot after each successful write, so storage stays bounded
+-- without a scheduled job. Per-row expiry: each row dies on its own Nth
+-- birthday. There is deliberately NO table wipe.
+--
+-- p_keep_days <= 0 means "keep forever" and is a no-op.
+
+create or replace function public.ai_memory_prune(
+    p_guild_id  bigint,
+    p_keep_days integer default 30
+)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+    v_deleted integer := 0;
+    v_cutoff  timestamptz;
+begin
+    -- SERVICE ROLE OR DEV ONLY. Service role has auth.uid() IS NULL, so the
+    -- is_dev() branch is what lets an operator run this by hand in the editor.
+    if auth.uid() is not null and not public.is_dev() then
+        raise exception 'not authorized' using errcode = '42501';
+    end if;
+
+    if p_keep_days is null or p_keep_days <= 0 then
+        return 0;
+    end if;
+
+    v_cutoff := now() - make_interval(days => least(p_keep_days, 3650));
+
+    delete from public.ai_memory
+     where guild_id = p_guild_id
+       and created_at < v_cutoff;
+
+    get diagnostics v_deleted = row_count;
+    return v_deleted;
+end;
+$$;
+
+comment on function public.ai_memory_prune(bigint, integer) is
+    'Deletes ai_memory rows older than p_keep_days for one guild. Per-row expiry, never a table wipe. p_keep_days <= 0 keeps forever.';
+
+revoke all on function public.ai_memory_prune(bigint, integer) from public;
+grant execute on function public.ai_memory_prune(bigint, integer) to authenticated;
 
 
 -- ============================================================================
@@ -693,19 +819,21 @@ on conflict (key) do update
 -- ============================================================================
 -- Run these after the script to confirm everything landed.
 
--- 08.1 Tables exist (expect 6 rows)
+-- 08.1 Tables exist (expect 7 rows)
 -- select tablename
 --   from pg_tables
 --  where schemaname = 'public'
 --    and tablename in ('guilds','guild_settings','user_guilds',
---                      'reply_actions','guild_replies','qotd_questions')
+--                      'reply_actions','guild_replies','qotd_questions',
+--                      'ai_memory')
 --  order by tablename;
 
--- 08.2 RLS enabled on all 6 (expect rls_enabled = true everywhere)
+-- 08.2 RLS enabled on all 7 (expect rls_enabled = true everywhere)
 -- select relname as table_name, relrowsecurity as rls_enabled, relforcerowsecurity as rls_forced
 --   from pg_class
 --  where relname in ('guilds','guild_settings','user_guilds',
---                    'reply_actions','guild_replies','qotd_questions');
+--                    'reply_actions','guild_replies','qotd_questions',
+--                    'ai_memory');
 
 -- 08.3 Policy count per table (expect a sensible number, not 0)
 -- select tablename, count(*) as policy_count
@@ -723,7 +851,7 @@ on conflict (key) do update
 -- select proname, prosecdef as is_security_definer
 --   from pg_proc
 --  where proname in ('can_manage_guild','qotd_add_question',
---                    'qotd_move_question','qotd_renumber');
+--                    'qotd_move_question','qotd_renumber','ai_memory_prune');
 
 -- ============================================================================
 -- END OF SCHEMA

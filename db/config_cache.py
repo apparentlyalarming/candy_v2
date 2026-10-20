@@ -39,6 +39,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "ai_temperature": 0.70,
     "ai_context_messages": 10,
     "ai_memory_enabled": True,
+    "ai_memory_days": 30,
+    "ai_memory_ignored_channels": [],
     "ai_user_cooldown_seconds": 5,
     "ai_all_channels": False,
     "ai_channel_ids": [],
@@ -125,8 +127,27 @@ class GuildConfig:
         return bool(self.get("ai_memory_enabled"))
 
     @property
+    def ai_memory_days(self) -> int:
+        """Retention window in days. 0 means keep forever."""
+        return int(self.get("ai_memory_days"))
+
+    @property
+    def ai_memory_ignored_channels(self) -> list[int]:
+        raw = self.get("ai_memory_ignored_channels") or []
+        result: list[int] = []
+        for item in raw:
+            parsed = to_id(item)
+            if parsed is not None:
+                result.append(parsed)
+        return result
+
+    def ai_memory_ignores(self, channel_id: int) -> bool:
+        """True when this channel is opted out of memory (no store, no recall)."""
+        return channel_id in self.ai_memory_ignored_channels
+
+    @property
     def ai_context_effective(self) -> int:
-        """How many past summaries to actually feed into a request.
+        """How many past messages to actually feed into a request.
 
         Memory off short-circuits the CONTEXT depth as well as the writes: a
         memory that is not being saved must not be read either, or turning it off
