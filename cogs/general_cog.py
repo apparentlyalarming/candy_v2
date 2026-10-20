@@ -1,12 +1,17 @@
 """General commands and gateway listeners.
 
 Owns:
-  - /hello, /help
+  - /hello, /help and the !help prefix equivalent
   - guild join/leave bookkeeping (guilds.bot_present, guilds row upkeep)
   - member join/leave logging
   - the on_message dispatcher that routes prefix commands
 
 The dispatcher lives here because routing is a general concern, not a fun one.
+
+The help menu is ROLE-AWARE: everyone sees the user commands, and the admin
+section is shown ONLY to members who can actually run those commands. Discord
+already hides /config from people without Manage Server, so documenting it to
+them would advertise commands they cannot use.
 """
 
 from __future__ import annotations
@@ -24,6 +29,23 @@ log = get_logger("cogs.general")
 
 # Acknowledge to Discord quickly during startup sync.
 SYNC_TIMEOUT_SECONDS = 60
+
+# Brand colour, shared by every help surface.
+BRAND_COLOUR = discord.Colour.from_str("#FFB6C1")
+
+
+def is_admin(member: discord.abc.User | discord.Member | None) -> bool:
+    """True when this member may see/run the admin surface.
+
+    Mirrors the gate Discord applies to the /config group (Manage Server) and the
+    manual check in _handle_memory_prefix, so the help menu and the commands it
+    documents agree on who is an admin. Members have guild_permissions; a User
+    (e.g. in a DM) does not, and is never an admin.
+    """
+    perms = getattr(member, "guild_permissions", None)
+    if perms is None:
+        return False
+    return bool(perms.manage_guild or perms.administrator)
 
 
 class GeneralCog(commands.Cog, name="General"):
@@ -43,10 +65,33 @@ class GeneralCog(commands.Cog, name="General"):
 
     @app_commands.command(name="help", description="Show everything Candy can do.")
     async def help_command(self, interaction: discord.Interaction) -> None:
+        embed = await self.build_help(interaction.user, interaction.guild_id)
+        # Ephemeral: the menu is for the person asking, not for the channel.
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ==================================================================
+    # help: one builder, shared by /help and !help
+    # ==================================================================
+
+    async def build_help(
+        self, member: discord.abc.User | discord.Member | None, guild_id: int | None
+    ) -> discord.Embed:
+        """Build the role-aware help embed.
+
+        Everyone gets General + Fun. The Admin section is appended ONLY for a
+        member who passes :func:`is_admin`, because that is who can run those
+        commands. An admin therefore sees a strict superset of a user's menu.
+        """
+        admin = is_admin(member)
+
         embed = discord.Embed(
             title="🍬 Candy's Command List",
-            description="Here's everything I can do.",
-            colour=discord.Colour.from_str("#FFB6C1"),
+            description=(
+                "Here's what I can do."
+                if not admin
+                else "Here's what I can do. You can see the admin section too."
+            ),
+            colour=BRAND_COLOUR,
         )
 
         embed.add_field(
@@ -61,34 +106,47 @@ class GeneralCog(commands.Cog, name="General"):
             inline=False,
         )
 
-        # Built from the live action catalog so it never goes stale.
+        # Built from the live action catalog so it never goes stale. Guarded: a
+        # catalog read failing must not break the whole menu.
         try:
             actions = await asyncio.to_thread(self.config.list_actions)
-        except Exception:
+        except Exception:  # noqa: BLE001
             actions = []
 
         if actions:
             names = "  ".join(f"`/{a.get('key')}`" for a in actions)
             embed.add_field(
                 name="🎉 Fun & Interaction",
-                value=f"{names}\n\nAll of these also work as text commands if prefix commands are enabled.",
+                value=(
+                    f"{names}\n\n"
+                    "All of these also work as text commands if prefix commands "
+                    "are enabled."
+                ),
                 inline=False,
             )
 
-        embed.add_field(
-            name="⚙️ Admin",
-            value=(
-                "`/config status` - see this server's setup\n"
-                "`/config chat` - AI model, prompt, channels\n"
-                "`/config replies` - customise fun action replies\n"
-                "`/config qotd` - Question of the Day\n"
-                "`/config general` - prefix and log channel"
-            ),
-            inline=False,
-        )
+        if admin:
+            embed.add_field(
+                name="⚙️ Admin",
+                value=(
+                    "`/config status` - see this server's setup\n"
+                    "`/config general` - prefix and log channel\n"
+                    "`/config chat` - AI model, prompt, channels, memory\n"
+                    "`/config replies` - customise fun action replies\n"
+                    "`/config qotd` - Question of the Day\n"
+                    "`!memory on|off` - toggle the AI's memory"
+                ),
+                inline=False,
+            )
 
-        embed.set_footer(text="Everything here is also configurable on the dashboard.")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        embed.set_footer(
+            text=(
+                "Everything here is also configurable on the dashboard."
+                if not admin
+                else "Admins can also configure me on the dashboard."
+            )
+        )
+        return embed
 
     # ==================================================================
     # gateway events
@@ -204,6 +262,13 @@ class GeneralCog(commands.Cog, name="General"):
             # config. Checked BEFORE the hello fallback so it is not shadowed.
             if body.split()[0:1] == ["memory"]:
                 await self._handle_memory_prefix(message, body, prefix)
+                return
+
+            # !help - the prefix twin of /help. Same builder, so the two surfaces
+            # can never drift.
+            if body.split()[0:1] == ["help"]:
+                embed = await self.build_help(message.author, message.guild.id)
+                await message.reply(embed=embed, mention_author=False)
                 return
 
             if body in {"hello", "hi", "hey"}:
