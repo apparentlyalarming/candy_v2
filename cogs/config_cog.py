@@ -37,11 +37,14 @@ log = get_logger("cogs.config")
 MANAGE_GUILD_PERMS = discord.Permissions(manage_guild=True)
 
 # Suggested models. Groq retires models over time, so free text is also allowed.
+# Order matters: this is the display order in /config chat model, and Groq's
+# deprecation notice recommends gpt-oss over the Llama entries below it.
 MODEL_CHOICES = [
+    app_commands.Choice(name="openai/gpt-oss-120b (default)", value="openai/gpt-oss-120b"),
+    app_commands.Choice(name="openai/gpt-oss-20b", value="openai/gpt-oss-20b"),
+    app_commands.Choice(name="qwen/qwen3.6-27b", value="qwen/qwen3.6-27b"),
     app_commands.Choice(name="llama-3.3-70b-versatile", value="llama-3.3-70b-versatile"),
     app_commands.Choice(name="llama-3.1-8b-instant", value="llama-3.1-8b-instant"),
-    app_commands.Choice(name="openai/gpt-oss-120b", value="openai/gpt-oss-120b"),
-    app_commands.Choice(name="openai/gpt-oss-20b", value="openai/gpt-oss-20b"),
 ]
 
 EVENT_CATEGORIES = [

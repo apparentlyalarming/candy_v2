@@ -22,7 +22,7 @@ export interface StructuredResult {
   degraded: boolean;
 }
 
-export const DEFAULT_MODEL = "llama-3.3-70b-versatile";
+export const DEFAULT_MODEL = "openai/gpt-oss-120b";
 export const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
 
 // Hard bounds so a misconfigured guild cannot burn the whole quota in one call.

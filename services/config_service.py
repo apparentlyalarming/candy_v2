@@ -91,7 +91,16 @@ class ConfigService:
         if existing is not None:
             config_cache.put(existing)
             return
-        row = supabase_client.upsert("guild_settings", {"guild_id": guild_id}, on_conflict="guild_id")
+        row = supabase_client.upsert(
+            "guild_settings",
+            # Write the default model explicitly instead of leaning on the
+            # column default, so the bot's DEFAULT_SETTINGS is the single
+            # source of truth for new guilds regardless of what default the
+            # live database was created with. Safe on conflict: this branch
+            # only runs when no row exists yet.
+            {"guild_id": guild_id, "ai_model": DEFAULT_SETTINGS["ai_model"]},
+            on_conflict="guild_id",
+        )
         if row:
             config_cache.put(row[0])
 

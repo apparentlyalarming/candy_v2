@@ -12,10 +12,13 @@
 //
 // AUTH
 //   Callers must present a valid Supabase JWT (either the bot's service_role key
-//   or a logged-in user's access token). Anything else gets 401.
+//   or a logged-in user's access token). Anything else gets 401. The bot's key
+//   is matched against SUPABASE_SERVICE_ROLE_KEY and, as a reconciliation
+//   fallback, against the custom BOT_SERVICE_KEY secret.
 //
 // DEPLOY
 //   supabase secrets set GROQ_API_KEY=gsk_...
+//   supabase secrets set BOT_SERVICE_KEY=eyJ...   (the bot's service_role key)
 //   supabase functions deploy chat
 //
 // The bot calls: {SUPABASE_URL}/functions/v1/chat
@@ -422,8 +425,19 @@ async function resolveCaller(
 ): Promise<{ ok: true; caller: string } | { ok: false }> {
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
-  // The bot path. Compare against the real secret: a forged token cannot match.
+  // The bot path. Two accepted values, both compared in constant time:
+  //   - SUPABASE_SERVICE_ROLE_KEY: platform-injected service role key
+  //   - BOT_SERVICE_KEY: a custom secret set to the exact key the bot sends.
+  //     Fallback for when the injected value and the bot's env drift apart -
+  //     the CLI refuses to overwrite SUPABASE_-prefixed names, so a custom
+  //     name is the only way to reconcile them from the command line.
+  // Both are service-role-equivalent shared secrets: exact-match comparison,
+  // so neither can be forged without already holding the value.
   if (serviceKey && timingSafeEqual(jwt, serviceKey)) {
+    return { ok: true, caller: "service_role" };
+  }
+  const botKey = Deno.env.get("BOT_SERVICE_KEY");
+  if (botKey && timingSafeEqual(jwt, botKey)) {
     return { ok: true, caller: "service_role" };
   }
 

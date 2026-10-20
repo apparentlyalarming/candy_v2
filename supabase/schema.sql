@@ -82,7 +82,7 @@ create table if not exists public.guild_settings (
 
     -- chat AI ---------------------------------------------------------------
     ai_enabled              boolean not null default false,
-    ai_model                text    not null default 'llama-3.3-70b-versatile',
+    ai_model                text    not null default 'openai/gpt-oss-120b',
     ai_system_prompt        text    not null default 'You are Candy, a friendly and helpful Discord bot. Keep replies short, warm and casual.',
     ai_max_tokens           integer not null default 512,
     ai_temperature          numeric(3,2) not null default 0.70,
@@ -383,6 +383,19 @@ begin
             check (ai_memory_days >= 0 and ai_memory_days <= 3650);
     end if;
 end $$;
+
+-- Default AI model moved to gpt-oss-120b (2026-10-20). `set default` only
+-- affects FUTURE inserts; the `update` treats rows still sitting on the old
+-- default as never-customized, so existing servers pick up the new default
+-- too. Both statements are idempotent, and a guild that chose a model via
+-- `/config chat model` keeps whatever it picked (only the old default value
+-- is migrated).
+alter table public.guild_settings
+    alter column ai_model set default 'openai/gpt-oss-120b';
+
+update public.guild_settings
+    set ai_model = 'openai/gpt-oss-120b'
+    where ai_model = 'llama-3.3-70b-versatile';
 
 
 -- ============================================================================

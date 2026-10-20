@@ -78,6 +78,25 @@ MARKER_NAME = ".boot_time"
 # keep working. Persistent views are re-attached in setup_hook via add_view().
 RENEW_BUTTON_ID = "candy:rotation:renewed"
 
+# Where the owner actually renews. A Discord button cannot both navigate and run a
+# callback, so the panel opens via a separate LINK button while "I've renewed"
+# keeps resetting the countdown.
+RENEW_PANEL_URL = "https://bot-hosting.net/a/billings"
+
+
+def panel_button() -> discord.ui.Button:
+    """The LINK button that opens the bot-hosting billing page.
+
+    Kept as a factory so the reminder DM and every fallback (log channels, the
+    acknowledged-message view) offer the same destination.
+    """
+    return discord.ui.Button(
+        label="Open bot-hosting panel",
+        style=discord.ButtonStyle.link,
+        emoji="🔗",
+        url=RENEW_PANEL_URL,
+    )
+
 
 def _parse_iso(raw: str) -> datetime | None:
     try:
@@ -165,6 +184,10 @@ class RenewalButtonView(discord.ui.View):
         # Rebind the id in case the class is instantiated before the module
         # constant is read; keeps a single source of truth for the id.
         self.children[0].custom_id = RENEW_BUTTON_ID  # type: ignore[union-attr]
+        # The panel link rides on the same row. Appended here instead of declared
+        # with @discord.ui.button: a LINK button has no custom_id and dispatches
+        # no callback, and adding it in code keeps children[0] above stable.
+        self.add_item(panel_button())
 
     @discord.ui.button(
         label="I've renewed",
@@ -200,6 +223,9 @@ class RenewalButtonView(discord.ui.View):
             label="Renewed", style=discord.ButtonStyle.secondary, emoji="✅", disabled=True
         )
         view.add_item(disabled)
+        # Keep the panel link alive on the acknowledged message too - the owner
+        # may still need to reach the panel after resetting the countdown.
+        view.add_item(panel_button())
 
         try:
             await interaction.response.edit_message(embed=embed, view=view)
@@ -472,7 +498,9 @@ class RotationReminder:
 
             try:
                 await channel.send(
-                    embed=embed, allowed_mentions=discord.AllowedMentions.none()
+                    embed=embed,
+                    view=RenewalButtonView(self),
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
                 posted = True
             except (discord.Forbidden, discord.NotFound):
@@ -492,8 +520,8 @@ class RotationReminder:
             description=(
                 "bot-hosting.net's free tier stops this bot unless the plan is "
                 "renewed **every 4 days**.\n\n"
-                "Renew in the bot-hosting panel, then press **I've renewed** below "
-                "to restart the countdown."
+                f"[Open the bot-hosting billing panel]({RENEW_PANEL_URL}) to renew, "
+                "then press **I've renewed** below to restart the countdown."
             ),
             colour=discord.Colour.orange(),
             timestamp=discord.utils.utcnow(),
@@ -568,4 +596,6 @@ __all__ = [
     "TICK_SECONDS",
     "RESEND_EVERY",
     "RENEW_BUTTON_ID",
+    "RENEW_PANEL_URL",
+    "panel_button",
 ]

@@ -63,12 +63,23 @@ in the host panel, then deploy.
 supabase login
 supabase link --project-ref <YOUR_PROJECT_REF>
 supabase secrets set GROQ_API_KEY=gsk_...
+supabase secrets set BOT_SERVICE_KEY=<the bot's SUPABASE_SERVICE_KEY value>
 supabase functions deploy chat --use-api
 ```
 
 `--use-api` bundles server-side and avoids Docker/Podman issues on
 SELinux-enforcing hosts. The function must stay named **`chat`** — the bot
 hardcodes `{SUPABASE_URL}/functions/v1/chat`.
+
+`BOT_SERVICE_KEY` is the exact service-role key the bot sends. The function
+matches it against the platform-injected `SUPABASE_SERVICE_ROLE_KEY` first and
+falls back to this custom secret, because the CLI refuses to overwrite
+`SUPABASE_`-prefixed names — if the injected value ever drifts from the bot's
+env, this is the reconciliation lever. Rotate it whenever the bot's key rotates:
+
+```bash
+supabase secrets set BOT_SERVICE_KEY=<new key>
+```
 
 ---
 

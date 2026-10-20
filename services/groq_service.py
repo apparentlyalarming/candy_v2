@@ -57,7 +57,15 @@ class GroqRateLimited(GroqError):
 
 
 class GroqUnavailable(GroqError):
-    """The Edge Function or Groq is unreachable / misconfigured."""
+    """The Edge Function or Groq is unreachable / misconfigured.
+
+    ``retryable`` distinguishes server blips (worth another attempt) from
+    auth/config failures (never heal on retry within the same process).
+    """
+
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 @dataclass
@@ -401,13 +409,32 @@ class GroqService:
                         )
 
                     if response.status_code == 401:
+                        # 401 from this function is caller auth, NOT the Groq
+                        # secret (a bad Groq key comes back as 503 upstream_auth).
+                        # Surface the function's own code/message so the log says
+                        # which side is wrong instead of a vague "check the secret".
+                        detail = _error_detail(response)
                         raise GroqUnavailable(
-                            "AI backend rejected the credentials. Check the chat function's secret."
+                            "Supabase rejected the bot's credentials "
+                            f"({detail}). Compare SUPABASE_SERVICE_KEY in the bot's "
+                            "env with the chat function's SUPABASE_SERVICE_ROLE_KEY "
+                            "secret.",
+                            retryable=False,
                         )
 
                     if response.status_code == 503:
+                        detail = _error_detail(response)
+                        if "upstream_auth" in detail:
+                            raise GroqUnavailable(
+                                "Groq rejected the chat function's GROQ_API_KEY "
+                                f"secret ({detail}). Rotate it with: supabase "
+                                "secrets set GROQ_API_KEY=gsk_...",
+                                retryable=False,
+                            )
                         raise GroqUnavailable(
-                            "AI backend is not configured. Set GROQ_API_KEY as a Supabase secret."
+                            "AI backend is not configured. Set GROQ_API_KEY as a "
+                            f"Supabase secret. ({detail})",
+                            retryable=False,
                         )
 
                     if response.status_code >= 500:
@@ -437,7 +464,7 @@ class GroqService:
                 except GroqUnavailable as exc:
                     last_error = exc
                     # Retry only server-side blips, not auth/config problems.
-                    if "rejected the credentials" in str(exc) or "not configured" in str(exc):
+                    if not exc.retryable:
                         raise
                 except (httpx.TimeoutException, httpx.TransportError) as exc:
                     last_error = GroqUnavailable(f"AI backend unreachable: {exc}")
@@ -506,6 +533,28 @@ def _parse_retry_after(response: httpx.Response) -> float | None:
         return float(raw)
     except ValueError:
         return None
+
+
+def _error_detail(response: httpx.Response) -> str:
+    """Compact ``code: message`` from an error response, for logs and messages.
+
+    Understands the Edge Function's ``{"error": {code, message}}`` envelope and
+    the flat ``{code, message}`` shape the Supabase gateway returns, falling
+    back to the raw body (truncated) so a proxy error page is never logged as
+    an empty string.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return (response.text or "").strip()[:200] or "no body"
+
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and (err.get("code") or err.get("message")):
+            return f"{err.get('code') or 'error'}: {err.get('message') or ''}".strip()
+        if body.get("code") or body.get("message"):
+            return f"{body.get('code') or 'error'}: {body.get('message') or ''}".strip()
+    return str(body)[:200]
 
 
 def _as_int(value: Any) -> int:

@@ -50,7 +50,7 @@ class Settings:
 
     # --- Groq --------------------------------------------------------------
     groq_api_key: str | None = None
-    groq_default_model: str = "llama-3.3-70b-versatile"
+    groq_default_model: str = "openai/gpt-oss-120b"
 
     # --- Behaviour ---------------------------------------------------------
     log_level: str = "INFO"
@@ -116,7 +116,7 @@ def load_settings() -> Settings:
         supabase_service_key=_get("SUPABASE_SERVICE_KEY") or "",
         # Groq is optional so the bot still boots without it.
         groq_api_key=os.getenv("GROQ_API_KEY") or None,
-        groq_default_model=os.getenv("GROQ_DEFAULT_MODEL", "llama-3.3-70b-versatile"),
+        groq_default_model=os.getenv("GROQ_DEFAULT_MODEL", "openai/gpt-oss-120b"),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         log_file=os.getenv("LOG_FILE", "logs/candy.log"),
         enable_realtime=_get_bool("ENABLE_REALTIME", True),

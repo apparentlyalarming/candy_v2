@@ -30,7 +30,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "log_categories": ["config", "errors", "qotd"],
     # chat AI
     "ai_enabled": False,
-    "ai_model": "llama-3.3-70b-versatile",
+    "ai_model": "openai/gpt-oss-120b",
     "ai_system_prompt": (
         "You are Candy, a friendly and helpful Discord bot. "
         "Keep replies short, warm and casual."
