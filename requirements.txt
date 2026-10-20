@@ -1,0 +1,19 @@
+# ==============================================================================
+# candy_v2 — Python dependencies
+# ==============================================================================
+# Pin the majors so a host rebuild cannot silently change behaviour.
+# discord.py 2.4+ is required for app_commands.Group parent/subcommand support
+# and for the modern MemberCacheFlags API.
+# ==============================================================================
+
+discord.py>=2.4,<3.0
+supabase>=2.0,<3.0
+httpx>=0.27,<1.0
+python-dotenv>=1.0,<2.0
+
+# --- not required -------------------------------------------------------------
+# groq: NOT a dependency. The Groq API key lives in Supabase secrets behind the
+#       `chat` Edge Function, so the bot never talks to Groq directly. Adding the
+#       SDK here would invite someone to bypass the function.
+# zoneinfo: stdlib on Python 3.9+, no package needed.
+# pytz: deliberately omitted. Use zoneinfo.

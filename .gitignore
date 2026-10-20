@@ -1,0 +1,81 @@
+# ==============================================================================
+# candy_v2 (Discord bot) — .gitignore
+# ==============================================================================
+
+# --- Local working log (not repo content, per project convention) -------------
+buildplan.txt
+
+# --- Secrets: NEVER commit these ---------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+service_account.json
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Virtual environments ----------------------------------------------------
+.venv/
+venv/
+ENV/
+env/
+.python-version
+
+# --- Testing / linting caches ------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# --- Bot runtime -------------------------------------------------------------
+*.log
+logs/
+data/
+*.sqlite
+*.sqlite3
+*.db
+
+# --- Supabase local dev ------------------------------------------------------
+supabase/.temp/
+supabase/.branches/
+.supabase/
+
+# --- Editors / OS ------------------------------------------------------------
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
