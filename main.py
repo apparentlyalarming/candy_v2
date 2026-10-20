@@ -28,6 +28,7 @@ from config import settings
 from db import realtime
 from services.config_service import ConfigService
 from services.groq_service import GroqService
+from services.rotation_reminder import RotationReminder, build_reminder
 from utils.event_log import make_emitter
 from utils.logging_setup import get_logger, setup_logging
 
@@ -67,6 +68,7 @@ class CandyBot(commands.Bot):
         self.config_service: ConfigService = ConfigService()
         self.groq_service: GroqService | None = None
         self.realtime_listener: realtime.RealtimeListener | None = None
+        self.rotation_reminder: RotationReminder | None = None
 
         # Prefix commands are dispatched by the general cog, not by the built-in
         # prefix machinery, so we return a prefix the bot would never match.
@@ -112,10 +114,22 @@ class CandyBot(commands.Bot):
         emitter = make_emitter(self)
         self.emit_log = emitter  # type: ignore[attr-defined]
 
-        # 5. Load cogs.
+        # 5. Host rotation reminder. The host is bot-hosting.net, whose free tier
+        #    stops the bot unless renewed every 4 days; the bot cannot read that
+        #    timer, so this watches its own uptime. Started here rather than in
+        #    on_ready so the clock exists even if Discord connects slowly.
+        if settings.rotation_reminder_days > 0:
+            self.rotation_reminder = build_reminder(
+                bot=self,
+                log_file=settings.log_file,
+                threshold_days=settings.rotation_reminder_days,
+            )
+            self.rotation_reminder.start()
+
+        # 6. Load cogs.
         await self._load_cogs()
 
-        # 6. Sync the command tree.
+        # 7. Sync the command tree.
         await self._sync_commands()
 
         log.info("Setup complete; connecting to Discord")
@@ -196,6 +210,10 @@ class CandyBot(commands.Bot):
         if self.realtime_listener is not None:
             with contextlib.suppress(Exception):
                 await self.realtime_listener.stop()
+
+        if self.rotation_reminder is not None:
+            with contextlib.suppress(Exception):
+                await self.rotation_reminder.stop()
 
         if self.groq_service is not None:
             with contextlib.suppress(Exception):

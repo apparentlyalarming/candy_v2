@@ -72,6 +72,10 @@ replies_group = app_commands.Group(
     name="replies", description="Fun action reply templates.", parent=config_group
 )
 
+dev_group = app_commands.Group(
+    name="dev", description="Bot-owner only: host maintenance.", parent=config_group
+)
+
 
 async def _to_thread(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
@@ -480,6 +484,69 @@ class ConfigCog(commands.Cog, name="Config"):
 
         note = "It now uses the default replies." if removed else "It was already on defaults."
         await interaction.response.send_message(f"Reset `{action}`. {note}", ephemeral=True)
+
+    # ==================================================================
+    # /config dev
+    # ==================================================================
+
+    async def _is_bot_owner(self, interaction: discord.Interaction) -> bool:
+        """True when the caller owns the bot application.
+
+        The host renewal is account-level, not per-guild, so Manage Server is the
+        wrong gate. ``discord.utils`` has no helper for this that avoids a fetch,
+        and ``interaction.client.application_info()`` is cached after first call.
+        """
+        try:
+            info = await interaction.client.application_info()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not check bot ownership: %s", exc)
+            return False
+
+        if info.team is not None:
+            return any(m.id == interaction.user.id for m in info.team.members)
+        return info.owner is not None and info.owner.id == interaction.user.id
+
+    @dev_group.command(
+        name="renewed",
+        description="Bot owner: reset the host-renewal reminder after renewing.",
+    )
+    async def dev_renewed(self, interaction: discord.Interaction) -> None:
+        if not await self._is_bot_owner(interaction):
+            await interaction.response.send_message(
+                "That command is for the bot owner only.", ephemeral=True
+            )
+            return
+
+        reminder = getattr(interaction.client, "rotation_reminder", None)
+        if reminder is None:
+            await interaction.response.send_message(
+                "The renewal reminder is disabled "
+                "(`ROTATION_REMINDER_DAYS=0`).",
+                ephemeral=True,
+            )
+            return
+
+        moment = await _to_thread(reminder.mark_renewed)
+        days = reminder.threshold_days
+
+        if interaction.guild_id is not None:
+            emit = getattr(interaction.client, "emit_log", None)
+            if emit is not None:
+                await emit(
+                    interaction.guild_id,
+                    "config",
+                    title="Host renewal recorded",
+                    description=f"{interaction.user} marked the host as renewed.",
+                    actor_id=interaction.user.id,
+                    actor_name=str(interaction.user),
+                    metadata={"source": "config dev renewed"},
+                )
+
+        await interaction.response.send_message(
+            f"Renewal recorded at {moment:%Y-%m-%d %H:%M} UTC. "
+            f"The reminder will next fire {days:.0f} day(s) from now.",
+            ephemeral=True,
+        )
 
     # ==================================================================
     # helper

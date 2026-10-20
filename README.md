@@ -79,8 +79,11 @@ Everything is editable from **both** Discord and the dashboard. In Discord:
 | `/config chat` | AI toggle, model, system prompt, channels, context, cooldown, temperature, max tokens |
 | `/config replies` | List, add, remove, toggle, reset fun action replies |
 | `/config qotd` | Toggle, time, timezone, channel, role, days, add, list, remove, next, skip |
+| `/config dev renewed` | Bot owner only. Resets the host-renewal reminder clock. |
 
-All `/config` subcommands require **Manage Server**.
+All `/config` subcommands require **Manage Server**, except `/config dev renewed`
+which requires being the **bot owner** — the host renewal is an account-level
+concern, not a per-server setting.
 
 ---
 
@@ -98,6 +101,49 @@ defaults, and a guild override takes precedence over the catalog default.
 
 Prefix commands are opt-out per guild and target the same code path as the slash
 equivalents.
+
+---
+
+## Host renewal reminder
+
+The bot runs on **bot-hosting.net's free tier**, which stops the bot unless the
+plan is manually renewed **every 4 days**. Miss the window and the bot goes
+offline until it is renewed.
+
+**The bot cannot read the host's renewal timer** — that clock lives entirely on
+bot-hosting's side. So the reminder measures the only clock the bot can observe:
+**how long its process has been running**.
+
+```
+ROTATION_REMINDER_DAYS=3     # remind after 3 days of uptime; 0 disables
+```
+
+Three days against a four-day window leaves a day of headroom, so the reminder
+arrives while there is still time to act.
+
+The reminder is delivered as a **DM to the bot owner**, resolved from Discord
+(`application_info().owner`) so no extra configuration is needed. If DMs are
+closed it falls back to each guild's log channel, and an account-level row is
+written to `bot_events` for the dashboard feed.
+
+After renewing, run **`/config dev renewed`** (bot owner only) to reset the clock.
+
+### Why uptime, and what that costs you
+
+A renewal does *not* restart the process, so a pure uptime clock drifts. But it
+drifts in the **safe direction**: a host restart (crash, platform reboot, deploy)
+resets the clock, which can only make the reminder *later*, never earlier. The
+failure mode that matters is "the bot is silently gone", so a slightly late
+reminder after a restart is acceptable where a missing one is not.
+
+If the host restarts more often than every three days, the clock never reaches
+the threshold and no reminder fires. In that case lower `ROTATION_REMINDER_DAYS`
+or treat the restarts themselves as the signal.
+
+The boot time is recorded in a marker file beside the log file (`.boot_time`
+under `logs/`). Deliberately, the marker is **not** rewritten on every start —
+only `/config dev renewed` resets it — otherwise a host that restarts hourly
+would never reach the threshold.
 
 ---
 
@@ -123,7 +169,8 @@ seed_replies.sql          Fun action reply catalog            (run 2nd)
 migration_002_logging.sql Logging, AI memory, activity feed   (run 3rd)
 
 db/                       Supabase client, config cache, Realtime listener
-services/                 Config writes, Groq client, rendering, QOTD scheduler
+services/                 Config writes, Groq client, rendering, QOTD scheduler,
+                          host rotation reminder
 cogs/                     config, general, fun, qotd, ai
 utils/                    Event logging, snowflake IDs, log setup
 supabase/functions/chat/  The Groq proxy (deployed to Supabase, not the bot)
