@@ -34,6 +34,12 @@ from utils.logging_setup import get_logger, setup_logging
 
 log = get_logger("main")
 
+# A prefix discord.py's built-in command processor can never match. The bot
+# dispatches prefix commands itself (see CandyBot._prefix_resolver), so the
+# built-in machinery must stay out of the way. A NUL byte cannot appear in a
+# Discord message, and message.content never starts with one.
+PREFIX_SENTINEL = "\x00"
+
 # Cogs loaded at startup. ORDER MATTERS: config_cog must load first because
 # cogs/qotd_cog.py parents its /config qotd subtree to config_group. Loading
 # qotd_cog first would raise CommandAlreadyRegistered on the root group.
@@ -70,19 +76,18 @@ class CandyBot(commands.Bot):
         self.realtime_listener: realtime.RealtimeListener | None = None
         self.rotation_reminder: RotationReminder | None = None
 
-        # Prefix commands are dispatched by the general cog, not by the built-in
-        # prefix machinery, so we return a prefix the bot would never match.
-        self._prefix_cache: str = "\x00"
-
     async def _prefix_resolver(self, bot: commands.Bot, message: discord.Message) -> list[str]:
-        """Per-guild prefix lookup from the cache."""
-        if message.guild is None:
-            return []
-        try:
-            prefix = self.config_service.get(message.guild.id).prefix
-            return [prefix]
-        except Exception:  # noqa: BLE001 - never break dispatch on a config hiccup
-            return [settings.command_prefix]
+        """Return a prefix the built-in processor can never match.
+
+        Prefix commands are dispatched by GeneralCog.on_message, NOT by discord.py's
+        built-in prefix machinery - this bot registers no @commands.command at all.
+        So the resolver must NOT return the guild's real prefix: doing that makes the
+        built-in processor treat every "!hug" / "!candy" / "!help" as an attempted
+        command, find nothing registered, and log a CommandNotFound error for each
+        one. Returning the sentinel short-circuits that, which is what the old
+        comment claimed while the code quietly did the opposite.
+        """
+        return [PREFIX_SENTINEL]
 
     # ------------------------------------------------------------------
 
