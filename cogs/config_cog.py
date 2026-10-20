@@ -122,6 +122,8 @@ class ConfigCog(commands.Cog, name="Config"):
             f"Enabled: {'yes' if cfg.ai_enabled else 'no'}  •  model: `{cfg.ai_model}`",
             f"Channels: {channels_text}",
             f"Temperature: {cfg.ai_temperature}  •  context: {cfg.ai_context_messages} messages",
+            f"Memory: {'on' if cfg.ai_memory_enabled else 'off'}"
+            + ("" if cfg.ai_memory_enabled else " (nothing read or saved)"),
             f"Cooldown: {cfg.ai_user_cooldown_seconds}s per user",
             "",
             "**Question of the Day**",
@@ -245,6 +247,36 @@ class ConfigCog(commands.Cog, name="Config"):
             interaction,
             lambda gid: self.config.set_ai_enabled(gid, enabled),
             f"AI chat is now **{'enabled' if enabled else 'disabled'}**.{suffix}",
+        )
+
+    @chat_group.command(
+        name="memory",
+        description="Let the AI remember this server (on), or forget (off).",
+    )
+    @app_commands.describe(
+        enabled="On: the AI recalls past chat. Off: it reads and saves nothing."
+    )
+    async def chat_memory(
+        self, interaction: discord.Interaction, enabled: bool
+    ) -> None:
+        # Note for the operator: turning memory off does NOT delete what was
+        # already stored, so the user is told it is reversible rather than left
+        # to assume their history was erased.
+        if enabled:
+            note = (
+                "The AI will recall earlier messages in each channel again. "
+                "Previously stored summaries were kept, so that context is back."
+            )
+        else:
+            note = (
+                "The AI will stop recalling past chat **and** stop saving new "
+                "summaries. Nothing already stored was deleted, so turning it "
+                "back on restores the previous context."
+            )
+        await self._apply(
+            interaction,
+            lambda gid: self.config.set_ai_memory_enabled(gid, enabled),
+            f"Memory is now **{'on' if enabled else 'off'}**. {note}",
         )
 
     @chat_group.command(name="model", description="Choose the AI model.")

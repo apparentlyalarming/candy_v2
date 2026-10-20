@@ -71,6 +71,7 @@ create table if not exists public.guild_settings (
     ai_max_tokens           integer not null default 512,
     ai_temperature          numeric(3,2) not null default 0.70,
     ai_context_messages     integer not null default 10,
+    ai_memory_enabled       boolean not null default true,   -- off = neither read nor write summaries
     ai_user_cooldown_seconds integer not null default 5,
     ai_all_channels         boolean not null default false,
     ai_channel_ids          bigint[] not null default '{}',   -- empty = DISABLED (unless ai_all_channels)
@@ -104,6 +105,8 @@ comment on table public.guild_settings is
     'Per-guild bot configuration. Single source of truth for both slash commands and the dashboard.';
 comment on column public.guild_settings.ai_channel_ids is
     'Channels where AI responds. Empty array = disabled (see ai_all_channels for everywhere).';
+comment on column public.guild_settings.ai_memory_enabled is
+    'When false the AI neither reads nor writes per-channel summaries. Existing rows are left untouched, so re-enabling restores prior context.';
 comment on column public.guild_settings.qotd_days is
     'Days of week QOTD fires: 1=Mon..7=Sun. Empty array = every day.';
 

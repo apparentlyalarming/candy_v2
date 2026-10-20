@@ -196,8 +196,18 @@ class AiCog(commands.Cog, name="AI"):
 
         Trimming runs on the same pass so storage stays bounded without a
         scheduled job: we write one row, then keep only the newest window.
+
+        Gated on the guild's memory flag. When memory is off nothing is written,
+        so a channel that is opted out leaves no trace beyond the reply itself.
+        The check lives here rather than at each call site so a future caller
+        cannot forget it.
         """
         if guild_id is None or self.config is None:
+            return
+
+        config = config_cache.get(guild_id)
+        if not config.ai_memory_enabled:
+            log.debug("Memory disabled for guild %s; not recording AI summary", guild_id)
             return
 
         def _work() -> None:
@@ -231,8 +241,10 @@ class AiCog(commands.Cog, name="AI"):
 
     @staticmethod
     def _context_count(config) -> int:
-        # History is kept per channel; 0 means "no history".
-        return max(0, config.ai_context_messages)
+        # History is kept per channel and only read when memory is on. 0 means
+        # "no history"; ai_context_effective already accounts for the memory flag
+        # while preserving the stored depth for when memory is re-enabled.
+        return max(0, config.ai_context_effective)
 
     @staticmethod
     def _trim(text: str, limit: int = 1900) -> str:

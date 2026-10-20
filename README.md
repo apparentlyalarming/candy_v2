@@ -36,9 +36,11 @@ pip install -r requirements.txt
 cp .env.example .env      # then fill in DISCORD_TOKEN, SUPABASE_URL, SUPABASE_SERVICE_KEY
 
 # 3. Create the database (run these IN ORDER in the Supabase SQL editor)
-#    schema.sql                -> tables, RLS, QOTD queue functions
-#    seed_replies.sql          -> the fun action reply catalog
-#    migration_002_logging.sql -> logging, AI memory, activity feed
+#    schema.sql                  -> tables, RLS, QOTD queue functions
+#    seed_replies.sql            -> the fun action reply catalog
+#    migration_002_logging.sql   -> logging, AI memory, activity feed
+#    migration_003_ai_memory.sql -> AI memory on/off toggle
+#    (existing installs: only the migrations you have not run yet)
 
 # 4. Run
 python main.py
@@ -76,7 +78,7 @@ Everything is editable from **both** Discord and the dashboard. In Discord:
 |---|---|
 | `/config status` | Current server setup at a glance |
 | `/config general` | Prefix, prefix toggle, log channel, log events, log toggle |
-| `/config chat` | AI toggle, model, system prompt, channels, context, cooldown, temperature, max tokens |
+| `/config chat` | AI toggle, model, system prompt, channels, context, memory, cooldown, temperature, max tokens |
 | `/config replies` | List, add, remove, toggle, reset fun action replies |
 | `/config qotd` | Toggle, time, timezone, channel, role, days, add, list, remove, next, skip |
 | `/config dev renewed` | Bot owner only. Resets the host-renewal reminder clock. |
@@ -168,6 +170,26 @@ Memory is a rolling window of the newest ~50 summaries **per channel**, trimmed
 as new ones arrive. Guild admins can see aggregate usage stats via
 `ai_stats_for_guild()`, which returns counts only and has no message-text column.
 
+### Turning memory off
+
+```
+!memory off              # prefix, Manage Server required
+/config chat memory off  # slash equivalent
+```
+
+Memory off means the AI **neither reads nor writes** summaries. It still answers,
+but every reply is made with no knowledge of the channel's history, and nothing
+new is recorded.
+
+**Nothing already stored is deleted.** Turning memory back on restores the
+previous context immediately, and past usage stats survive. This is a deliberate
+choice: "off" is meant to be a switch, not a shredder.
+
+The flag is separate from `ai_context_messages`, because the two answer different
+questions — that one is *how many* past summaries to recall, this one is *whether
+to recall at all*. Read depth is left untouched while memory is off, so
+re-enabling restores the configured depth rather than resetting it to zero.
+
 ---
 
 ## Project layout
@@ -178,6 +200,7 @@ config.py                 Environment configuration
 schema.sql                Tables, RLS, QOTD queue functions   (run 1st)
 seed_replies.sql          Fun action reply catalog            (run 2nd)
 migration_002_logging.sql Logging, AI memory, activity feed   (run 3rd)
+migration_003_ai_memory.sql AI memory on/off toggle           (run 4th)
 
 db/                       Supabase client, config cache, Realtime listener
 services/                 Config writes, Groq client, rendering, QOTD scheduler,

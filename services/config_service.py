@@ -265,6 +265,15 @@ class ConfigService:
         _check_range("context messages", value, AI_CONTEXT_MIN, AI_CONTEXT_MAX)
         self._update_settings(guild_id, {"ai_context_messages": int(value)})
 
+    def set_ai_memory_enabled(self, guild_id: int, enabled: bool) -> None:
+        """Turn per-channel memory on or off.
+
+        Off means the AI neither reads past summaries nor writes new ones.
+        Existing ai_interactions rows are deliberately NOT deleted, so turning it
+        back on restores prior context. Read depth is preserved separately.
+        """
+        self._update_settings(guild_id, {"ai_memory_enabled": bool(enabled)})
+
     def set_ai_cooldown(self, guild_id: int, seconds: int) -> None:
         _check_range("cooldown", seconds, COOLDOWN_MIN, COOLDOWN_MAX)
         self._update_settings(guild_id, {"ai_user_cooldown_seconds": int(seconds)})

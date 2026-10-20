@@ -38,6 +38,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "ai_max_tokens": 512,
     "ai_temperature": 0.70,
     "ai_context_messages": 10,
+    "ai_memory_enabled": True,
     "ai_user_cooldown_seconds": 5,
     "ai_all_channels": False,
     "ai_channel_ids": [],
@@ -118,6 +119,24 @@ class GuildConfig:
     @property
     def ai_context_messages(self) -> int:
         return int(self.get("ai_context_messages"))
+
+    @property
+    def ai_memory_enabled(self) -> bool:
+        return bool(self.get("ai_memory_enabled"))
+
+    @property
+    def ai_context_effective(self) -> int:
+        """How many past summaries to actually feed into a request.
+
+        Memory off short-circuits the CONTEXT depth as well as the writes: a
+        memory that is not being saved must not be read either, or turning it off
+        would still leak stale context into replies. The stored
+        ``ai_context_messages`` is preserved untouched so re-enabling restores
+        the previous depth rather than resetting it to 0.
+        """
+        if not self.ai_memory_enabled:
+            return 0
+        return max(0, self.ai_context_messages)
 
     @property
     def ai_user_cooldown_seconds(self) -> int:
