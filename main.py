@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import signal
 import sys
 
@@ -55,7 +56,18 @@ COGS = [
 class CandyBot(commands.Bot):
     """discord.py client with the shared services attached."""
 
-    def __init__(self) -> None:
+    def __init__(self, repair_mode: bool = False) -> None:
+        """repair_mode builds the command tree and nothing else.
+
+        Used by the --clear-commands / CLEAR_COMMANDS one-shot repair. In that
+        mode setup_hook must NOT start the realtime listener, the rotation
+        reminder, or the normal sync: the process only needs an HTTP session to
+        rewrite Discord's registrations, then exits. Starting real services here
+        would leak background tasks and, worse, run a NORMAL sync before the
+        clear - which is the very thing the repair is undoing.
+        """
+        self.repair_mode = repair_mode
+
         # Intents: message_content enables prefix commands (!hug). members is
         # enabled because prefix-command admin checks read guild_permissions.
         intents = discord.Intents.default()
@@ -94,6 +106,15 @@ class CandyBot(commands.Bot):
     async def setup_hook(self) -> None:
         """Runs after login, before the gateway connects."""
         log.info("Starting candy_v2 (Python %s, discord.py %s)", sys.version.split()[0], discord.__version__)
+
+        if self.repair_mode:
+            # Load cogs only, so the command tree is populated, then clear and
+            # rebuild. No Supabase, no realtime, no reminders - this process
+            # exists solely to rewrite Discord's registrations.
+            log.warning("Repair mode: skipping services, loading cogs only")
+            await self._load_cogs()
+            await self._clear_and_resync()
+            return
 
         # 1. Verify Supabase is reachable and load the cache.
         await self._load_config_cache()
@@ -165,6 +186,83 @@ class CandyBot(commands.Bot):
                 log.info("Loaded %s", extension)
             except Exception as exc:
                 log.error("Failed to load %s: %s", extension, exc, exc_info=True)
+
+    async def _clear_and_resync(self) -> None:
+        """One-shot repair: wipe every registration, then re-sync.
+
+        WHY THIS EXISTS
+            App command registrations live on Discord's side and OUTLIVE the
+            bot's code. If an earlier deploy ran with DEV_GUILD_IDS empty, it
+            registered commands GLOBALLY. Setting DEV_GUILD_IDS later makes the
+            bot register into the GUILD scope instead - but it never removes the
+            old global copies, because nothing in the normal sync path clears.
+
+            The result is two live registrations of the same command name. Since
+            CommandTree.fallback_to_global defaults to True, an invocation in the
+            guild can be served by the STALE GLOBAL one, whose parameter list no
+            longer matches the code. Discord then fails the interaction with:
+
+                CommandSignatureMismatch: The signature for command 'x' is
+                different from the one provided by Discord.
+
+            A guild sync alone cannot fix this. The stale entry is global, so a
+            global clear is the only thing that removes it.
+
+        WHAT IT DOES
+            1. snapshots the currently-registered commands (they are the SOURCE
+               for the guild copies, so they must survive the wipe)
+            2. clears the global scope and syncs, so Discord drops the stale globals
+            3. clears each dev guild's scope and syncs, dropping stale guild copies
+            4. restores the global commands and copies them into each dev guild
+
+        THE TRAP THIS AVOIDS
+            clear_commands(guild=None) empties the GLOBAL scope, and
+            copy_global_to(guild=...) copies FROM that scope. Clearing first and
+            copying afterwards therefore re-registers NOTHING - it would wipe the
+            whole command tree instead of repairing it. So the commands are
+            snapshotted up front and put back before any copy.
+        """
+        log.warning("Clear-and-resync requested: wiping ALL command registrations")
+
+        # 1) Snapshot. These come from the cogs that setup_hook already loaded,
+        #    and they are the source for every guild copy below.
+        snapshot = list(self.tree.get_commands(guild=None))
+        if not snapshot:
+            log.error(
+                "Refusing to clear: the tree is empty, so there is nothing to "
+                "restore. This would delete every command. Are the cogs loaded?"
+            )
+            return
+        log.info("Snapshot holds %d commands to restore", len(snapshot))
+
+        # 2) Global scope. An empty sync is how discord.py deletes commands.
+        self.tree.clear_commands(guild=None)
+        n = await self.tree.sync()
+        log.info("Cleared global scope; Discord now holds %d global commands", len(n))
+
+        # 3) Every dev guild scope.
+        for guild_id in settings.dev_guild_ids:
+            guild = discord.Object(id=guild_id)
+            self.tree.clear_commands(guild=guild)
+            n = await self.tree.sync(guild=guild)
+            log.info("Cleared guild scope %s; Discord now holds %d commands", guild_id, len(n))
+
+        # 4) Put the commands back, then re-register. Skip step 1's branch in
+        #    _sync_commands by doing the copy explicitly for the dev guilds.
+        for cmd in snapshot:
+            self.tree.add_command(cmd)
+
+        if settings.dev_guild_ids:
+            for guild_id in settings.dev_guild_ids:
+                guild = discord.Object(id=guild_id)
+                self.tree.copy_global_to(guild=guild)
+                n = await self.tree.sync(guild=guild)
+                log.info("Re-registered %d commands to guild %s", len(n), guild_id)
+        else:
+            n = await self.tree.sync()
+            log.info("Re-registered %d commands globally", len(n))
+
+        log.info("Clear-and-resync complete")
 
     async def _sync_commands(self) -> None:
         """Sync the app command tree.
@@ -239,7 +337,15 @@ class CandyBot(commands.Bot):
 async def main() -> None:
     setup_logging(settings.log_level, settings.log_file)
 
-    bot = CandyBot()
+    # One-shot command-tree repair. Triggered either by a CLI flag (if the host
+    # exposes a start command) or by an env var (if it only exposes variables).
+    # See CandyBot._clear_and_resync for why a stale registration needs this.
+    repair = (
+        "--clear-commands" in sys.argv
+        or os.getenv("CLEAR_COMMANDS", "").strip().lower() in ("1", "true", "yes")
+    )
+
+    bot = CandyBot(repair_mode=repair)
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -251,6 +357,15 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, _request_shutdown, sig.name)
+
+    if repair:
+        # The command tree needs only a REST session and the application id, so
+        # login() is enough - its setup_hook call does the clear and re-sync.
+        log.warning("CLEAR_COMMANDS active - wiping and rebuilding the command tree, then exiting")
+        await bot.login(settings.discord_token)
+        await bot.close()
+        log.warning("Repair mode finished. REMOVE CLEAR_COMMANDS / --clear-commands now.")
+        return
 
     async with bot:
         try:
