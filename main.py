@@ -300,6 +300,18 @@ class CandyBot(commands.Bot):
         # Refresh guild metadata and make sure every guild has a settings row.
         await self._refresh_guilds()
 
+        # Then make bot_present agree with reality. After a crash or a restart
+        # the flag can be stale in either direction, because join/leave events
+        # are missed while the bot is offline. The dashboard hides guilds the
+        # bot is not in, so a stale `true` would show a dead server.
+        try:
+            await asyncio.to_thread(
+                self.config_service.reconcile_bot_presence,
+                {guild.id for guild in self.guilds},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not reconcile bot_present: %s", exc)
+
     async def _refresh_guilds(self) -> None:
         for guild in self.guilds:
             try:

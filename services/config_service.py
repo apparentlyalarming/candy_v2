@@ -92,7 +92,13 @@ class ConfigService:
             supabase_client.upsert("guilds", payload, on_conflict="id")
             log.info("Registered guild %s (%s)", gid, name or "unknown")
         elif name and existing.get("name") != name:
-            supabase_client.update("guilds", {"name": name, "icon_url": icon_url, "bot_present": True}, filters={"id": gid})
+            # Refresh identity only. bot_present must NOT be set here: this
+            # branch fires whenever the stored name is stale, which has nothing
+            # to do with whether the bot is in the guild. Stamping True here
+            # marked guilds the bot had left (or never joined) as present.
+            supabase_client.update(
+                "guilds", {"name": name, "icon_url": icon_url}, filters={"id": gid}
+            )
 
         self._ensure_settings_row(gid)
 
@@ -122,6 +128,48 @@ class ConfigService:
             return
         supabase_client.update("guilds", {"bot_present": False}, filters={"id": gid})
         log.info("Marked guild %s as bot_present=false", gid)
+
+    def reconcile_bot_presence(self, present_ids: set[int]) -> None:
+        """Make `guilds.bot_present` agree with reality.
+
+        Gateway events alone are not enough: a remove that happens while the bot
+        is down is never seen, and a leave during a crash is missed. So on every
+        startup we trust the live `self.guilds` as the source of truth and write
+        both directions.
+
+        - every guild the bot is in          -> bot_present = true
+        - every other known guilds row       -> bot_present = false
+
+        Runs as service_role, so it may touch rows outside the bot's own guilds.
+        """
+        client = supabase_client.get_client()
+
+        # Everything the bot is currently in.
+        if present_ids:
+            client.table("guilds").update({"bot_present": True}).in_(
+                "id", sorted(present_ids)
+            ).execute()
+
+        # Everything else that is still flagged present.
+        stale = client.table("guilds").select("id").eq("bot_present", True).execute()
+        stale_ids = [
+            int(row["id"])
+            for row in (stale.data or [])
+            if int(row["id"]) not in present_ids
+        ]
+        if stale_ids:
+            client.table("guilds").update({"bot_present": False}).in_(
+                "id", stale_ids
+            ).execute()
+            log.info(
+                "Reconciled bot_present: marked %d guild(s) absent: %s",
+                len(stale_ids),
+                ", ".join(str(i) for i in stale_ids),
+            )
+
+        log.info(
+            "Reconciled bot_present: %d guild(s) present", len(present_ids)
+        )
 
     # ------------------------------------------------------------------
     # generic write
