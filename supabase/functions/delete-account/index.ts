@@ -17,9 +17,16 @@
 //     - user_preferences (on delete cascade)  -> the saved theme
 //     - dev_users        (on delete cascade)  -> the dev allowlist row
 //
+//   Two tables do NOT key on auth.users, so no cascade reaches them. This
+//   function removes their rows by hand, using the Discord snowflake it reads
+//   from profiles first (after the auth user is gone, that mapping is gone too):
+//     - bot_dms         the user's direct messages to the Bot
+//     - bot_dm_outbox   replies the operator had queued to send to them
+//   Direct messages are deleted rather than blanked, because a DM thread is
+//   about one person and loses its meaning without them.
+//
 // WHAT SURVIVES, WITHOUT YOU
-//   Two tables keep their rows for the server's continuity, and neither is
-//   reached by those cascades because neither keys on auth.users:
+//   Two tables keep their rows for the server's continuity:
 //     - ai_memory   the conversation text (a reply is uninterpretable without
 //                   the prompt it answers), so the TEXT stays and the
 //                   identifiers are cleared.
@@ -28,8 +35,8 @@
 //   A Discord snowflake is a name tag, not an anonymous number: leaving it on a
 //   row would make the word "anonymised" false, so this function clears
 //   discord_user_id / user_display_name and actor_id / actor_name explicitly
-//   BEFORE deleting the user. If that step fails the function reports the
-//   failure and deletes nothing, rather than quietly leaving the identifiers.
+//   BEFORE deleting the user. If any of these steps fails the function reports
+//   the failure and deletes nothing, rather than quietly leaving the identifiers.
 //
 // AUTH
 //   The caller must present their own valid Supabase user JWT. The function
@@ -140,7 +147,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
   const discordUserId: string | null = profile?.discord_user_id_text ?? null;
   if (discordUserId !== null) {
-    const [memory, events] = await Promise.all([
+    const [memory, events, dms, outbox] = await Promise.all([
       admin
         .from("ai_memory")
         .update({ discord_user_id: null, user_display_name: null })
@@ -149,8 +156,16 @@ Deno.serve(async (req: Request): Promise<Response> => {
         .from("bot_events")
         .update({ actor_id: null, actor_name: null })
         .eq("actor_id", discordUserId),
+      admin
+        .from("bot_dms")
+        .delete()
+        .eq("discord_user_id", discordUserId),
+      admin
+        .from("bot_dm_outbox")
+        .delete()
+        .eq("recipient_id", discordUserId),
     ]);
-    const failure = memory.error ?? events.error;
+    const failure = memory.error ?? events.error ?? dms.error ?? outbox.error;
     if (failure) {
       // Refuse rather than half-fulfil: the response below promises the link is
       // gone, and a retry is cheap.
@@ -171,7 +186,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
       // State plainly what happened, including the two things that are kept and
       // what was removed from them.
       note:
-        "Your account, server memberships, AI interaction summaries and dashboard preferences were deleted. " +
+        "Your account, server memberships, AI interaction summaries, dashboard preferences, and your direct messages to the Bot were deleted. " +
         "Conversation memory kept by servers you chatted in stays as text, with your Discord id and display name cleared, " +
         "and activity log entries for those servers stay with the acting user cleared.",
     }),

@@ -1426,7 +1426,7 @@ alter table public.admin_requests force row level security;
 -- ============================================================================
 -- Run these after the script to confirm everything landed.
 
--- 08.1 Tables exist (expect 15 rows)
+-- 08.1 Tables exist (expect 16 rows)
 -- select tablename
 --   from pg_tables
 --  where schemaname = 'public'
@@ -1437,7 +1437,7 @@ alter table public.admin_requests force row level security;
 --                      'admin_audit','admin_requests')
 --  order by tablename;
 
--- 08.2 RLS enabled on all 15 (expect rls_enabled = true everywhere)
+-- 08.2 RLS enabled on all 16 (expect rls_enabled = true everywhere)
 -- select relname as table_name, relrowsecurity as rls_enabled, relforcerowsecurity as rls_forced
 --   from pg_class
 --  where relname in ('guilds','guild_settings','user_guilds',
@@ -1446,7 +1446,8 @@ alter table public.admin_requests force row level security;
 --                    'user_preferences','bot_dms','bot_dm_outbox',
 --                    'admin_audit','admin_requests');
 
--- 08.3 Policy count per table (expect a sensible number, not 0)
+-- 08.3 Policy count per table (expect a sensible number for the user-facing
+--      tables and ZERO for the operator tables, which are deny-all by design).
 -- select tablename, count(*) as policy_count
 --   from pg_policies
 --  where schemaname = 'public'
