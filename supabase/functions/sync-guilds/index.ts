@@ -280,10 +280,16 @@ Deno.serve(async (req: Request): Promise<Response> => {
   // --------------------------------------------------------------------
   // 6. Merge bot_present from the database and return
   // --------------------------------------------------------------------
-  const { data: botRows } = await admin
+  // `id::text` is not cosmetic. PostgREST serialises bigint as a JSON number,
+  // and Discord snowflakes exceed 2^53, so 1482658029542576210 comes back as
+  // 1482658029542576000. The lookup then misses and every guild reports
+  // bot_present:false, which the dashboard reads as "no servers". Casting in
+  // SQL keeps the id exact.
+  const { data: botRows, error: botErr } = await admin
     .from("guilds")
-    .select("id,bot_present")
+    .select("id::text,bot_present")
     .in("id", manageable.map((m) => m.guild.id));
+  if (botErr) console.error("sync-guilds bot_present lookup failed:", botErr.message);
   const botPresent = new Map<string, boolean>(
     (botRows ?? []).map((r: { id: unknown; bot_present: unknown }) => [
       String(r.id),
