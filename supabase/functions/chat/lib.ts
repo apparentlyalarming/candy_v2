@@ -3,7 +3,7 @@
 // ============================================================================
 
 export interface ChatRequestBody {
-  /** Groq model id, e.g. "openai/gpt-oss-120b". */
+  /** Model id to send to the inference provider, e.g. "openai/gpt-oss-120b". */
   model?: string;
   /** OpenAI-compatible message array: [{role, content}, ...]. */
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
