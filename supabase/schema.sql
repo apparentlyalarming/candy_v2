@@ -643,6 +643,7 @@ alter table public.ai_interactions enable row level security;
 alter table public.bot_events      enable row level security;
 alter table public.dev_users       enable row level security;
 alter table public.user_preferences enable row level security;
+alter table public.profiles        enable row level security;
 
 -- Belt and braces: also force RLS for table owners where applicable.
 alter table public.guilds          force row level security;
