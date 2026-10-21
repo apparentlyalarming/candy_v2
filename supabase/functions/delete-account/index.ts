@@ -11,13 +11,25 @@
 //
 // WHAT GETS DELETED
 //   Deleting the auth user cascades through the schema's foreign keys:
+//     - profiles        (on delete cascade)  -> the account <-> Discord id link
 //     - user_guilds      (on delete cascade)  -> all guild memberships
 //     - ai_interactions  (on delete cascade)  -> the user's own summaries
 //     - user_preferences (on delete cascade)  -> the saved theme
 //     - dev_users        (on delete cascade)  -> the dev allowlist row
-//   ai_memory.user_id is "on delete set null" BY DESIGN: the transcript stays
-//   for the server's continuity but is anonymised. It is never linked back to
-//   a person afterwards. The response states this so the promise is not vague.
+//
+// WHAT SURVIVES, WITHOUT YOU
+//   Two tables keep their rows for the server's continuity, and neither is
+//   reached by those cascades because neither keys on auth.users:
+//     - ai_memory   the conversation text (a reply is uninterpretable without
+//                   the prompt it answers), so the TEXT stays and the
+//                   identifiers are cleared.
+//     - bot_events  the server's audit trail, so the EVENT stays and the actor
+//                   is cleared.
+//   A Discord snowflake is a name tag, not an anonymous number: leaving it on a
+//   row would make the word "anonymised" false, so this function clears
+//   discord_user_id / user_display_name and actor_id / actor_name explicitly
+//   BEFORE deleting the user. If that step fails the function reports the
+//   failure and deletes nothing, rather than quietly leaving the identifiers.
 //
 // AUTH
 //   The caller must present their own valid Supabase user JWT. The function
@@ -106,6 +118,46 @@ Deno.serve(async (req: Request): Promise<Response> => {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 
+  // --- strip identifiers that no cascade reaches ---------------------------
+  // The row has to be read first: after the auth user is gone, the mapping from
+  // account to Discord snowflake is gone with it.
+  //
+  // Read it as TEXT. A Discord snowflake is ~1e18, well past JS's 2^53 exact
+  // integer range, so PostgREST's JSON number is already rounded by the time it
+  // reaches us (…333 arrives as …400) and an `eq` filter built from that number
+  // matches no rows at all - the update would silently do nothing while the
+  // response still claimed the identifiers were cleared. Same rule as the
+  // dashboard: cast every snowflake to text.
+  const { data: profile, error: profileError } = await admin
+    .from("profiles")
+    .select("discord_user_id_text:discord_user_id::text")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (profileError) {
+    return errorResponse(500, "profile_lookup_failed", profileError.message);
+  }
+
+  const discordUserId: string | null = profile?.discord_user_id_text ?? null;
+  if (discordUserId !== null) {
+    const [memory, events] = await Promise.all([
+      admin
+        .from("ai_memory")
+        .update({ discord_user_id: null, user_display_name: null })
+        .eq("discord_user_id", discordUserId),
+      admin
+        .from("bot_events")
+        .update({ actor_id: null, actor_name: null })
+        .eq("actor_id", discordUserId),
+    ]);
+    const failure = memory.error ?? events.error;
+    if (failure) {
+      // Refuse rather than half-fulfil: the response below promises the link is
+      // gone, and a retry is cheap.
+      return errorResponse(500, "anonymise_failed", failure.message);
+    }
+  }
+
   // Delete the auth user. The schema's foreign keys cascade the rest, so we do
   // not delete rows by hand (which could drift from the constraints).
   const { error } = await admin.auth.admin.deleteUser(userId);
@@ -116,10 +168,12 @@ Deno.serve(async (req: Request): Promise<Response> => {
   return new Response(
     JSON.stringify({
       deleted: true,
-      // State plainly what happened, including the one thing that is retained.
+      // State plainly what happened, including the two things that are kept and
+      // what was removed from them.
       note:
-        "Your account, guild memberships, AI interaction summaries and dashboard preferences were deleted. " +
-        "Conversation memory kept by servers you chatted in is anonymised (no longer linked to you).",
+        "Your account, server memberships, AI interaction summaries and dashboard preferences were deleted. " +
+        "Conversation memory kept by servers you chatted in stays as text, with your Discord id and display name cleared, " +
+        "and activity log entries for those servers stay with the acting user cleared.",
     }),
     { status: 200, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } },
   );
