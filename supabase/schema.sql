@@ -338,6 +338,26 @@ comment on table public.dev_users is
     'Users allowed to read every ai_interactions row via is_dev(). Grant sparingly.';
 
 
+-- ---------------------------------------------------------------------------
+-- user_preferences: per-account dashboard settings (theme, etc.)
+-- ---------------------------------------------------------------------------
+-- The dashboard stores the chosen theme in localStorage so it applies before
+-- login, and mirrors it here when the user is signed in so a second device
+-- picks it up instead of asking again. One row per user; only the owner can
+-- read or write it.
+
+create table if not exists public.user_preferences (
+    user_id    uuid primary key references auth.users(id) on delete cascade,
+    theme      text not null default 'light',
+    updated_at timestamptz not null default now(),
+    constraint user_preferences_theme_valid
+        check (theme in ('light','glass','contrast'))
+);
+
+comment on table public.user_preferences is
+    'Per-account dashboard preferences (currently the UI theme). Owner-only via RLS.';
+
+
 -- ============================================================================
 -- 02b  COLUMN MIGRATIONS
 -- ============================================================================
@@ -497,6 +517,11 @@ create trigger guild_replies_touch_updated_at
     before update on public.guild_replies
     for each row execute function public.touch_updated_at();
 
+drop trigger if exists user_preferences_touch_updated_at on public.user_preferences;
+create trigger user_preferences_touch_updated_at
+    before update on public.user_preferences
+    for each row execute function public.touch_updated_at();
+
 
 -- ---------------------------------------------------------------------------
 -- can_manage_guild(gid): does the CURRENT USER manage this guild?
@@ -577,6 +602,7 @@ alter table public.ai_memory       enable row level security;
 alter table public.ai_interactions enable row level security;
 alter table public.bot_events      enable row level security;
 alter table public.dev_users       enable row level security;
+alter table public.user_preferences enable row level security;
 
 -- Belt and braces: also force RLS for table owners where applicable.
 alter table public.guilds          force row level security;
@@ -589,6 +615,7 @@ alter table public.ai_memory       force row level security;
 alter table public.ai_interactions force row level security;
 alter table public.bot_events      force row level security;
 alter table public.dev_users       force row level security;
+alter table public.user_preferences force row level security;
 
 -- ---------------------------------------------------------------------------
 -- guilds
@@ -774,6 +801,38 @@ drop policy if exists "dev_users_select_self" on public.dev_users;
 create policy "dev_users_select_self"
     on public.dev_users
     for select
+    to authenticated
+    using (user_id = auth.uid());
+
+-- ---------------------------------------------------------------------------
+-- user_preferences: a user reads and writes ONLY their own row.
+-- ---------------------------------------------------------------------------
+drop policy if exists "user_preferences_select_own" on public.user_preferences;
+create policy "user_preferences_select_own"
+    on public.user_preferences
+    for select
+    to authenticated
+    using (user_id = auth.uid());
+
+drop policy if exists "user_preferences_insert_own" on public.user_preferences;
+create policy "user_preferences_insert_own"
+    on public.user_preferences
+    for insert
+    to authenticated
+    with check (user_id = auth.uid());
+
+drop policy if exists "user_preferences_update_own" on public.user_preferences;
+create policy "user_preferences_update_own"
+    on public.user_preferences
+    for update
+    to authenticated
+    using (user_id = auth.uid())
+    with check (user_id = auth.uid());
+
+drop policy if exists "user_preferences_delete_own" on public.user_preferences;
+create policy "user_preferences_delete_own"
+    on public.user_preferences
+    for delete
     to authenticated
     using (user_id = auth.uid());
 
@@ -1145,21 +1204,23 @@ grant execute on function public.ai_trim_channel(bigint, bigint, integer) to aut
 -- ============================================================================
 -- Run these after the script to confirm everything landed.
 
--- 08.1 Tables exist (expect 10 rows)
+-- 08.1 Tables exist (expect 11 rows)
 -- select tablename
 --   from pg_tables
 --  where schemaname = 'public'
 --    and tablename in ('guilds','guild_settings','user_guilds',
 --                      'reply_actions','guild_replies','qotd_questions',
---                      'ai_memory','ai_interactions','bot_events','dev_users')
+--                      'ai_memory','ai_interactions','bot_events','dev_users',
+--                      'user_preferences')
 --  order by tablename;
 
--- 08.2 RLS enabled on all 10 (expect rls_enabled = true everywhere)
+-- 08.2 RLS enabled on all 11 (expect rls_enabled = true everywhere)
 -- select relname as table_name, relrowsecurity as rls_enabled, relforcerowsecurity as rls_forced
 --   from pg_class
 --  where relname in ('guilds','guild_settings','user_guilds',
 --                    'reply_actions','guild_replies','qotd_questions',
---                    'ai_memory','ai_interactions','bot_events','dev_users');
+--                    'ai_memory','ai_interactions','bot_events','dev_users',
+--                    'user_preferences');
 
 -- 08.3 Policy count per table (expect a sensible number, not 0)
 -- select tablename, count(*) as policy_count
@@ -1216,6 +1277,12 @@ grant execute on function public.ai_trim_channel(bigint, bigint, integer) to aut
 -- 08.9 qotd_empty_queue_notice should stay false unless an admin asked for it
 -- select guild_id, qotd_empty_queue_notice from public.guild_settings
 --  where qotd_empty_queue_notice;
+
+-- 08.10 user_preferences has owner-only policies (expect 4 rows).
+--       The dashboard writes the chosen theme here when signed in.
+-- select policyname, cmd from pg_policies
+--  where schemaname = 'public' and tablename = 'user_preferences'
+--  order by policyname;
 
 -- ============================================================================
 -- END OF SCHEMA
