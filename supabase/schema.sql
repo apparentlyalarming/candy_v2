@@ -155,7 +155,26 @@ create table if not exists public.user_guilds (
 );
 
 comment on table public.user_guilds is
-    'Written ONLY by the sync-guilds Edge Function / service_role. Users must never insert here - RLS trusts this table completely.';
+    'Written ONLY by the sync-guilds / apply-guild-settings Edge Functions and the bot. Rows expire after 10 minutes (see can_manage_guild), so this is a cache of a recent Discord answer, not a standing grant.';
+
+comment on column public.user_guilds.synced_at is
+    'When Discord last confirmed this membership. can_manage_guild() refuses rows older than 10 minutes.';
+
+-- ---------------------------------------------------------------------------
+-- profiles: auth user <-> Discord snowflake
+-- ---------------------------------------------------------------------------
+-- needed for a mapping the bot can use: auth.users is not exposed through
+-- PostgREST, so the bot cannot join a member_remove event (which carries a
+-- Discord ID) to a user_guilds row (keyed by uuid) without this.
+create table if not exists public.profiles (
+    user_id         uuid primary key references auth.users(id) on delete cascade,
+    discord_user_id bigint not null unique,
+    created_at      timestamptz not null default now(),
+    updated_at      timestamptz not null default now()
+);
+
+comment on table public.profiles is
+    'Written by the Edge Functions (service_role) from the caller''s Discord identity. Used by the bot to revoke dashboard access on leave/demotion.';
 
 
 -- ---------------------------------------------------------------------------
@@ -391,6 +410,17 @@ alter table public.guild_settings
 alter table public.guild_settings
     add column if not exists ai_memory_ignored_channels bigint[] not null default '{}';
 
+-- The QOTD queue index predates the uniqueness requirement, so an existing
+-- database still has the non-unique version and `create unique index if not
+-- exists` above would silently skip it. Drop and rebuild so the live queue
+-- gains the constraint that stops two admins inserting the same position.
+-- Safe to re-run; it is dropped by the same name whether or not it was unique.
+drop index if exists public.qotd_questions_queue_idx;
+
+create unique index if not exists qotd_questions_queue_idx
+    on public.qotd_questions (guild_id, position)
+    where asked_at is null;
+
 -- Constrain log categories to the known set (guarded: constraint creation is
 -- not idempotent the way add column is).
 do $$
@@ -435,8 +465,12 @@ update public.guild_settings
 -- 03  INDEXES
 -- ============================================================================
 
--- Fast "next unasked question" lookup + ordering
-create index if not exists qotd_questions_queue_idx
+-- Fast "next unasked question" lookup + ordering.
+-- UNIQUE on purpose: two admins adding a question at the same moment could
+-- otherwise compute the same max(position) and both insert it, leaving the
+-- queue with duplicate positions and an arbitrary order. The index also serves
+-- the lookup it replaced, so it doubles as the ordering index.
+create unique index if not exists qotd_questions_queue_idx
     on public.qotd_questions (guild_id, position)
     where asked_at is null;
 
@@ -522,6 +556,11 @@ create trigger user_preferences_touch_updated_at
     before update on public.user_preferences
     for each row execute function public.touch_updated_at();
 
+drop trigger if exists profiles_touch_updated_at on public.profiles;
+create trigger profiles_touch_updated_at
+    before update on public.profiles
+    for each row execute function public.touch_updated_at();
+
 
 -- ---------------------------------------------------------------------------
 -- can_manage_guild(gid): does the CURRENT USER manage this guild?
@@ -542,6 +581,7 @@ as $$
         from public.user_guilds ug
         where ug.guild_id = gid
           and ug.user_id = auth.uid()
+          and ug.synced_at > (now() - interval '10 minutes')
           and (
                 ug.is_admin
                 or (ug.permissions & 32) = 32      -- 32 = MANAGE_GUILD
@@ -551,7 +591,7 @@ as $$
 $$;
 
 comment on function public.can_manage_guild(bigint) is
-    'True when auth.uid() has MANAGE_GUILD (32) or ADMINISTRATOR (8) in the given guild. SECURITY DEFINER breaks RLS recursion.';
+    'True when auth.uid() has MANAGE_GUILD (32) or ADMINISTRATOR (8) in the given guild and permissions were verified within the last 10 minutes. SECURITY DEFINER breaks RLS recursion.';
 
 -- Lock the helper down: only the RLS engine / authenticated users should call it.
 revoke all on function public.can_manage_guild(bigint) from public;
@@ -616,6 +656,7 @@ alter table public.ai_interactions force row level security;
 alter table public.bot_events      force row level security;
 alter table public.dev_users       force row level security;
 alter table public.user_preferences force row level security;
+alter table public.profiles       force row level security;
 
 -- ---------------------------------------------------------------------------
 -- guilds
@@ -640,22 +681,16 @@ create policy "guild_settings_select_managed"
     to authenticated
     using (public.can_manage_guild(guild_id));
 
-drop policy if exists "guild_settings_insert_managed" on public.guild_settings;
-create policy "guild_settings_insert_managed"
-    on public.guild_settings
-    for insert
-    to authenticated
-    with check (public.can_manage_guild(guild_id));
-
-drop policy if exists "guild_settings_update_managed" on public.guild_settings;
-create policy "guild_settings_update_managed"
-    on public.guild_settings
-    for update
-    to authenticated
-    using (public.can_manage_guild(guild_id))
-    with check (public.can_manage_guild(guild_id));
-
 -- No delete policy: settings rows are never deleted by users (cascade handles guild removal).
+
+-- Writes are NOT granted to the browser at all. A stale JWT plus a stale
+-- user_guilds row used to be enough to PATCH this table directly through
+-- PostgREST, bypassing the dashboard entirely, for as long as the attacker
+-- avoided triggering a sync. The only writer is now the apply-guild-settings
+-- Edge Function, which asks Discord at the moment of the write.
+revoke insert, update on public.guild_settings from anon, authenticated;
+drop policy if exists "guild_settings_insert_managed" on public.guild_settings;
+drop policy if exists "guild_settings_update_managed" on public.guild_settings;
 
 -- ---------------------------------------------------------------------------
 -- user_guilds
@@ -669,6 +704,20 @@ create policy "user_guilds_select_own"
 
 -- No insert/update/delete policies on purpose. Only service_role writes here.
 -- If a user could insert their own rows, they could grant themselves any guild.
+
+-- ---------------------------------------------------------------------------
+-- profiles
+-- ---------------------------------------------------------------------------
+drop policy if exists "profiles_select_own" on public.profiles;
+create policy "profiles_select_own"
+    on public.profiles
+    for select
+    to authenticated
+    using (user_id = auth.uid());
+
+-- service_role only for writes: a user must not be able to claim another
+-- Discord identity and inherit that person's access.
+revoke insert, update, delete on public.profiles from anon, authenticated;
 
 -- ---------------------------------------------------------------------------
 -- reply_actions (public catalog: readable by everyone, writable by nobody)
@@ -855,6 +904,7 @@ as $$
 declare
     v_next_position integer;
     v_row public.qotd_questions;
+    v_attempt integer;
 begin
     if not public.can_manage_guild(p_guild_id) then
         raise exception 'not authorized for guild %', p_guild_id
@@ -865,16 +915,45 @@ begin
         raise exception 'question must not be blank' using errcode = '22023';
     end if;
 
-    select coalesce(max(position), 0) + 1
-      into v_next_position
-      from public.qotd_questions
-     where guild_id = p_guild_id;
+    -- Serialize concurrent adds for this guild. Two admins adding at the same
+    -- instant would otherwise read the same max(position) and insert the same
+    -- position. Locking existing queue rows makes the second caller wait and
+    -- then re-read a correct max.
+    --
+    -- The lock is a no-op when the queue is empty (zero rows to lock), which is
+    -- why the unique index on (guild_id, position) exists as the real guarantee.
+    -- Retry once so that race resolves into the next free position instead of
+    -- surfacing a raw 23505 to the admin.
+    for v_attempt in 1..2 loop
+        perform 1
+          from public.qotd_questions
+         where guild_id = p_guild_id
+           for update;
 
-    insert into public.qotd_questions (guild_id, question, position, created_by)
-    values (p_guild_id, btrim(p_question), v_next_position, auth.uid())
-    returning * into v_row;
+        select coalesce(max(position), 0) + 1
+          into v_next_position
+          from public.qotd_questions
+         where guild_id = p_guild_id;
 
-    return v_row;
+        begin
+            insert into public.qotd_questions (guild_id, question, position, created_by)
+            values (p_guild_id, btrim(p_question), v_next_position, auth.uid())
+            returning * into v_row;
+
+            return v_row;
+        exception
+            when unique_violation then
+                -- Another add slipped in between our read and insert. Loop to
+                -- re-read the new max.
+                if v_attempt = 2 then
+                    raise exception 'could not allocate a queue position, please retry'
+                        using errcode = '40001';
+                end if;
+        end;
+    end loop;
+
+    raise exception 'could not allocate a queue position, please retry'
+        using errcode = '40001';
 end;
 $$;
 

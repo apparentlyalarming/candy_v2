@@ -1,64 +1,53 @@
 // ============================================================================
 // Edge Function: sync-guilds
 // ============================================================================
-// Returns the Discord servers the caller can manage, and refreshes the
-// `user_guilds` table so Row Level Security has accurate permission rows.
+// Returns the Discord servers the caller may manage, and refreshes the
+// `user_guilds` table so Row Level Security has current permission rows.
 //
-// WHY THIS EXISTS
-//   The dashboard is a browser and holds only a user token. Discord's guild
-//   list (and the MANAGE_GUILD bit) cannot be read from the database, and the
-//   `user_guilds` table must be written with elevated rights. This function is
-//   the one place that bridges the two.
+// WHAT CHANGED AND WHY
+//   This used to build the list from the caller's Discord OAuth token
+//   (`provider_token`), which the browser supplies. That made permission
+//   revocation the client's job: a demoted admin simply never called this
+//   function and kept their `user_guilds` row — and therefore database write
+//   access — forever.
+//
+//   It now asks Discord with the BOT token instead. The bot is in exactly the
+//   guilds the dashboard can serve, so "the bot's guild list, filtered by
+//   whether this Discord user is an admin in each" is the same set, derived
+//   from an authority the caller cannot avoid.
+//
+//   Combined with the 10-minute TTL in `can_manage_guild()` and the
+//   apply-guild-settings write gate, a stale row is no longer a standing grant.
 //
 // AUTH
-//   The caller must present a valid Supabase user JWT (the logged-in user's
-//   access token). The Discord access token is supplied in the body as
-//   `provider_token` — it is the token Discord issued during OAuth, which the
-//   browser received from Supabase and never stores server-side. We use it once,
-//   for this request, and never persist it.
-//
-// SECURITY
-//   - The Discord token is used to call Discord, then discarded. It is never
-//     written to the database, never logged, and never echoed back.
-//   - guild_id values come from Discord, not from the caller, so a user cannot
-//     claim a guild they are not in.
-//   - The service-role client bypasses RLS deliberately: this function is the
-//     trusted writer of `user_guilds`. Every row it writes is derived from
-//     Discord's own answer for the authenticated user.
+//   Supabase user JWT only. No provider_token is needed or accepted.
 //
 // DEPLOY
-//   supabase functions deploy sync-guilds
-//   (SUPABASE_URL, SUPABASE_ANON_KEY and SUPABASE_SERVICE_ROLE_KEY are injected
-//    automatically; no extra secrets are required.)
-//
-// The dashboard calls: {SUPABASE_URL}/functions/v1/sync-guilds
-// with { provider_token } and the user's access token in Authorization.
+//   supabase functions deploy sync-guilds --use-api
+//   Requires the DISCORD_BOT_TOKEN secret.
 // ============================================================================
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  DISCORD_API,
+  DISCORD_TIMEOUT_MS,
+  fetchWithTimeout,
+  getDiscordUserId,
+  listBotGuilds,
+  verifyGuildAdmin,
+} from "../_shared/discord_verify.ts";
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-const DISCORD_API = "https://discord.com/api/v10";
+/** Only resolve channels/roles for this many guilds; Discord rate-limits per guild. */
+const DETAIL_LIMIT = 10;
 
-/** Discord permission bits we care about. */
-const ADMINISTRATOR = 0x8n; // 8
-const MANAGE_GUILD = 0x20n; // 32
-
-const DISCORD_TIMEOUT_MS = 15_000;
-
-interface DiscordGuild {
-  id: string;
-  name: string;
-  icon: string | null;
-  owner?: boolean;
-  permissions?: string;
-}
+/** Verify at most this many guilds at once. */
+const VERIFY_CONCURRENCY = 4;
 
 interface DiscordChannel {
   id: string;
@@ -74,15 +63,11 @@ interface DiscordRole {
   position: number;
 }
 
-function errorResponse(
-  status: number,
-  code: string,
-  message: string,
-): Response {
-  return new Response(
-    JSON.stringify({ error: { code, message } }),
-    { status, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } },
-  );
+function errorResponse(status: number, code: string, message: string): Response {
+  return new Response(JSON.stringify({ error: { code, message } }), {
+    status,
+    headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+  });
 }
 
 function json(body: unknown, status = 200): Response {
@@ -92,213 +77,174 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-/** fetch with a hard timeout so a hung Discord call cannot pin the worker. */
-async function fetchWithTimeout(
-  url: string,
-  init: RequestInit,
-  timeoutMs: number,
-): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
+/** Run tasks with bounded concurrency so we do not trip Discord's rate limits. */
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      out[index] = await fn(items[index]);
+    }
+  });
+  await Promise.all(workers);
+  return out;
 }
 
 Deno.serve(async (req: Request): Promise<Response> => {
-  if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: CORS_HEADERS });
-  }
-  if (req.method !== "POST") {
-    return errorResponse(405, "method_not_allowed", "Use POST.");
-  }
+  if (req.method === "OPTIONS") return new Response("ok", { headers: CORS_HEADERS });
+  if (req.method !== "POST") return errorResponse(405, "method_not_allowed", "Use POST.");
 
   // --------------------------------------------------------------------
   // 1. Authenticate the Supabase user
   // --------------------------------------------------------------------
-  const authHeader = req.headers.get("Authorization") ?? "";
-  const jwt = authHeader.replace(/^Bearer\s+/i, "").trim();
-  if (!jwt) {
-    return errorResponse(401, "missing_auth", "Missing Authorization header.");
-  }
+  const jwt = (req.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
+  if (!jwt) return errorResponse(401, "missing_auth", "Missing Authorization header.");
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const anonKey = Deno.env.get("SUPABASE_ANON_KEY");
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const botToken = Deno.env.get("DISCORD_BOT_TOKEN");
   if (!supabaseUrl || !anonKey || !serviceKey) {
     return errorResponse(500, "server_misconfigured", "Supabase env missing.");
   }
+  if (!botToken) {
+    return errorResponse(
+      500,
+      "server_misconfigured",
+      "DISCORD_BOT_TOKEN is not set. Run: supabase secrets set DISCORD_BOT_TOKEN=...",
+    );
+  }
 
-  // Verify the token with Supabase's auth server; never trust a decoded JWT.
+  const admin = createClient(supabaseUrl, serviceKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+
+  // The auth server validates the signature; we never decode the JWT ourselves.
   let userId: string | null = null;
   try {
     const res = await fetchWithTimeout(
       `${supabaseUrl.replace(/\/+$/, "")}/auth/v1/user`,
       { method: "GET", headers: { Authorization: `Bearer ${jwt}`, apikey: anonKey } },
-      10_000,
+      8_000,
     );
     if (res.ok) {
       const user = await res.json();
       if (typeof user?.id === "string" && user.id) userId = user.id;
     }
   } catch {
-    // fall through to the null check below
+    // handled below
   }
-  if (!userId) {
-    return errorResponse(401, "invalid_auth", "Invalid or expired token.");
-  }
+  if (!userId) return errorResponse(401, "invalid_auth", "Invalid or expired token.");
 
   // --------------------------------------------------------------------
-  // 2. Read the Discord provider token from the body
+  // 2. Which Discord account is this?
   // --------------------------------------------------------------------
-  let providerToken = "";
-  try {
-    const body = await req.json();
-    if (typeof body?.provider_token === "string") providerToken = body.provider_token;
-  } catch {
-    return errorResponse(400, "bad_json", "Request body must be valid JSON.");
-  }
-  if (!providerToken) {
+  const discordUserId = await getDiscordUserId(jwt, supabaseUrl, anonKey);
+  if (!discordUserId) {
     return errorResponse(
-      400,
-      "missing_provider_token",
-      "provider_token is required. Log out and back in to refresh your Discord token.",
+      409,
+      "no_discord_identity",
+      "This account has no linked Discord identity. Log out and sign in with Discord.",
     );
   }
 
-  const discordHeaders = { Authorization: `Bearer ${providerToken}` };
+  // Remember the mapping: the bot needs it to revoke access from gateway events
+  // (auth.users is not reachable from PostgREST).
+  const { error: profileErr } = await admin
+    .from("profiles")
+    .upsert(
+      { user_id: userId, discord_user_id: discordUserId, updated_at: new Date().toISOString() },
+      { onConflict: "user_id" },
+    );
+  if (profileErr) {
+    // Non-fatal: everything below still works, only bot revocation is delayed.
+    console.error("sync-guilds profile upsert failed:", profileErr.message);
+  }
 
   // --------------------------------------------------------------------
-  // 3. Ask Discord which guilds this user is in
+  // 3. Enumerate the bot's guilds and check membership/permissions in each
   // --------------------------------------------------------------------
-  let guilds: DiscordGuild[];
+  let botGuilds: Awaited<ReturnType<typeof listBotGuilds>>;
   try {
-    const res = await fetchWithTimeout(
-      `${DISCORD_API}/users/@me/guilds`,
-      { headers: discordHeaders },
-      DISCORD_TIMEOUT_MS,
-    );
-    if (res.status === 401) {
-      return errorResponse(
-        401,
-        "discord_token_invalid",
-        "Your Discord token expired. Log out and back in to refresh it.",
-      );
-    }
-    if (!res.ok) {
-      return errorResponse(502, "discord_error", `Discord returned ${res.status}.`);
-    }
-    guilds = await res.json();
-    if (!Array.isArray(guilds)) guilds = [];
-  } catch {
-    return errorResponse(504, "discord_timeout", "Discord did not respond in time.");
+    botGuilds = await listBotGuilds(botToken);
+  } catch (err) {
+    return errorResponse(502, "discord_error", `Could not list bot guilds: ${String(err)}`);
   }
 
-  // --------------------------------------------------------------------
-  // 4. Keep only guilds where the user can actually manage settings
-  // --------------------------------------------------------------------
-  const manageable = guilds.filter((g) => {
-    if (g.owner) return true;
-    let perms = 0n;
-    try {
-      perms = BigInt(g.permissions ?? "0");
-    } catch {
-      perms = 0n;
-    }
-    return (perms & ADMINISTRATOR) === ADMINISTRATOR || (perms & MANAGE_GUILD) === MANAGE_GUILD;
+  const checks = await mapLimit(botGuilds, VERIFY_CONCURRENCY, async (guild) => {
+    const result = await verifyGuildAdmin(botToken, guild.id, discordUserId);
+    return { guild, result };
   });
 
-  // --------------------------------------------------------------------
-  // 5. Write guilds + user_guilds with the service role
-  // --------------------------------------------------------------------
-  const admin = createClient(supabaseUrl, serviceKey, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
+  const manageable = checks.filter((c) => c.result.ok);
 
+  // --------------------------------------------------------------------
+  // 4. Write guilds + user_guilds with the service role
+  // --------------------------------------------------------------------
   const nowIso = new Date().toISOString();
 
-  // guilds: identity/name/icon. bot_present is owned by the bot, so we do NOT
-  // overwrite it here — a dashboard sync must not claim the bot left or joined.
   if (manageable.length > 0) {
-    const guildRows = manageable.map((g) => ({
-      id: g.id,
-      name: g.name,
-      icon_url: g.icon
-        ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png?size=128`
+    const guildRows = manageable.map(({ guild, result }) => ({
+      id: guild.id,
+      name: result.guild?.name ?? guild.name,
+      icon_url: guild.icon
+        ? `https://cdn.discordapp.com/icons/${guild.id}/${guild.icon}.png?size=128`
         : null,
       updated_at: nowIso,
     }));
+    // bot_present is owned by the bot, so it is deliberately not written here.
     const { error: guildErr } = await admin
       .from("guilds")
       .upsert(guildRows, { onConflict: "id", ignoreDuplicates: false });
-    if (guildErr) {
-      return errorResponse(500, "db_guilds_failed", guildErr.message);
-    }
+    if (guildErr) return errorResponse(500, "db_guilds_failed", guildErr.message);
 
-    const membershipRows = manageable.map((g) => ({
+    const membershipRows = manageable.map(({ guild, result }) => ({
       user_id: userId,
-      guild_id: g.id,
-      is_admin: Boolean(g.owner) ||
-        ((() => {
-          try {
-            return (BigInt(g.permissions ?? "0") & ADMINISTRATOR) === ADMINISTRATOR;
-          } catch {
-            return false;
-          }
-        })()),
-      // Send the raw bitmask as a STRING: it is a 64-bit value and a JS number
-      // silently loses precision above 2^53. PostgREST coerces the string into
-      // the bigint column exactly.
-      permissions: (g.permissions ?? "0"),
+      guild_id: guild.id,
+      is_admin: result.isAdmin,
+      // Decimal string: the bitmask exceeds 2^53, and a JS number would lose
+      // precision. PostgREST coerces the string into bigint exactly.
+      permissions: result.permissions,
       synced_at: nowIso,
     }));
     const { error: memberErr } = await admin
       .from("user_guilds")
       .upsert(membershipRows, { onConflict: "user_id,guild_id" });
-    if (memberErr) {
-      return errorResponse(500, "db_members_failed", memberErr.message);
-    }
+    if (memberErr) return errorResponse(500, "db_members_failed", memberErr.message);
   }
 
-  // Drop stale memberships: a user who lost access (or left) must not keep an
-  // RLS-granting row. Delete this user's rows that are no longer in the list.
-  const keepIds = manageable.map((g) => g.id);
+  // Prune this user's rows for guilds where they are no longer a member/admin.
+  // Scoped to user_id, so one admin's sync can never touch another's rows.
+  const keepIds = manageable.map((m) => m.guild.id);
   let deleteQuery = admin.from("user_guilds").delete().eq("user_id", userId);
   if (keepIds.length > 0) {
     deleteQuery = deleteQuery.not("guild_id", "in", `(${keepIds.join(",")})`);
   }
   const { error: pruneErr } = await deleteQuery;
-  if (pruneErr) {
-    // Non-fatal: the upsert above already succeeded. Report but continue.
-    console.error("sync-guilds prune failed:", pruneErr.message);
-  }
+  if (pruneErr) console.error("sync-guilds prune failed:", pruneErr.message);
 
   // --------------------------------------------------------------------
-  // 6. Fetch channels + roles, for the top few guilds only
+  // 5. Fetch channels + roles (bot token) for the first few guilds
   // --------------------------------------------------------------------
-  // Discord rate-limits per-guild; fetching every guild's channels on each sync
-  // would be slow and could trip 429s. We resolve the guilds the caller asked
-  // about (all manageable ones, capped) and degrade to empty lists on failure —
-  // the dashboard renders without them rather than showing wrong data.
-  const CHANNEL_FETCH_LIMIT = 10;
-  const guildsWithDetail = await Promise.all(
-    manageable.slice(0, CHANNEL_FETCH_LIMIT).map(async (g) => {
+  const withDetail = await mapLimit(
+    manageable.slice(0, DETAIL_LIMIT),
+    VERIFY_CONCURRENCY,
+    async ({ guild, result }) => {
       let channels: Array<{ id: string; name: string; type: number }> = [];
       let roles: Array<{ id: string; name: string; color: number }> = [];
+      const headers = {
+        Authorization: `Bot ${botToken}`,
+        "User-Agent": "DiscordBot (https://candy-web-beryl.vercel.app, 1.0)",
+      };
       try {
         const [chRes, roleRes] = await Promise.all([
-          fetchWithTimeout(
-            `${DISCORD_API}/guilds/${g.id}/channels`,
-            { headers: discordHeaders },
-            DISCORD_TIMEOUT_MS,
-          ),
-          fetchWithTimeout(
-            `${DISCORD_API}/guilds/${g.id}/roles`,
-            { headers: discordHeaders },
-            DISCORD_TIMEOUT_MS,
-          ),
+          fetchWithTimeout(`${DISCORD_API}/guilds/${guild.id}/channels`, { headers }, DISCORD_TIMEOUT_MS),
+          fetchWithTimeout(`${DISCORD_API}/guilds/${guild.id}/roles`, { headers }, DISCORD_TIMEOUT_MS),
         ]);
         if (chRes.ok) {
           const raw: DiscordChannel[] = await chRes.json();
@@ -315,39 +261,38 @@ Deno.serve(async (req: Request): Promise<Response> => {
             .map((r) => ({ id: r.id, name: r.name, color: r.color }));
         }
       } catch {
-        // Leave the empty lists; the dashboard shows "no channels" rather than
-        // inventing them.
+        // Degrade to empty lists rather than inventing data.
       }
       return {
-        id: g.id,
-        name: g.name,
-        icon_url: g.icon
-          ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png?size=128`
+        id: guild.id,
+        name: result.guild?.name ?? guild.name,
+        icon_url: guild.icon
+          ? `https://cdn.discordapp.com/icons/${guild.id}/${guild.icon}.png?size=128`
           : null,
-        is_admin: Boolean(g.owner),
-        permissions: g.permissions ?? "0",
+        is_admin: result.isAdmin,
+        permissions: result.permissions,
         channels,
         roles,
       };
-    }),
+    },
   );
 
   // --------------------------------------------------------------------
-  // 7. Merge in bot_present from the database and return
+  // 6. Merge bot_present from the database and return
   // --------------------------------------------------------------------
   const { data: botRows } = await admin
     .from("guilds")
     .select("id,bot_present")
-    .in("id", manageable.map((g) => g.id));
+    .in("id", manageable.map((m) => m.guild.id));
   const botPresent = new Map<string, boolean>(
-    (botRows ?? []).map((r) => [String(r.id), Boolean(r.bot_present)]),
+    (botRows ?? []).map((r: { id: unknown; bot_present: unknown }) => [
+      String(r.id),
+      Boolean(r.bot_present),
+    ]),
   );
 
   return json({
-    guilds: guildsWithDetail.map((g) => ({
-      ...g,
-      bot_present: botPresent.get(g.id) ?? false,
-    })),
+    guilds: withDetail.map((g) => ({ ...g, bot_present: botPresent.get(g.id) ?? false })),
     synced_at: nowIso,
   });
 });

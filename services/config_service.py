@@ -129,6 +129,74 @@ class ConfigService:
         supabase_client.update("guilds", {"bot_present": False}, filters={"id": gid})
         log.info("Marked guild %s as bot_present=false", gid)
 
+    # ------------------------------------------------------------------
+    # dashboard access (revocation)
+    # ------------------------------------------------------------------
+    # The dashboard's RLS trusts `user_guilds`, but that table is only written
+    # when the *user's* browser calls sync-guilds. A demoted or banned admin who
+    # never triggers a sync would keep write access until the 10-minute TTL in
+    # can_manage_guild() expired. The bot is already connected to the gateway, so
+    # it can revoke the row the moment Discord says the permission is gone.
+
+    def _user_id_for_discord(self, discord_user_id: int) -> str | None:
+        """Map a Discord snowflake to the auth user, if that person has signed in."""
+        rows = supabase_client.select(
+            "profiles", "user_id", filters={"discord_user_id": discord_user_id}, limit=1
+        )
+        if not rows:
+            return None
+        user_id = rows[0].get("user_id")
+        return str(user_id) if user_id else None
+
+    def revoke_dashboard_access(self, guild_id: int, discord_user_id: int) -> bool:
+        """Drop one user's dashboard access to one guild.
+
+        Called on leave/kick/ban and on loss of ADMINISTRATOR/MANAGE_GUILD.
+        Returns True when a row was actually removed.
+        """
+        gid = to_id(guild_id)
+        uid = to_id(discord_user_id)
+        if gid is None or uid is None:
+            return False
+
+        user_id = self._user_id_for_discord(uid)
+        if user_id is None:
+            # Never signed in to the dashboard: nothing cached to revoke.
+            return False
+
+        removed = supabase_client.delete(
+            "user_guilds", filters={"user_id": user_id, "guild_id": gid}
+        )
+        if removed:
+            log.info(
+                "Revoked dashboard access: user %s (discord %s) guild %s",
+                user_id,
+                uid,
+                gid,
+            )
+            return True
+        return False
+
+    def invalidate_dashboard_access(self, guild_id: int) -> int:
+        """Expire every cached permission row for a guild.
+
+        Used when a role's permissions change or the role is deleted: the set of
+        affected members is large and each one must be re-verified, so rather
+        than guessing we stamp them stale and let the TTL refuse them until the
+        next sync re-earns the row.
+        """
+        gid = to_id(guild_id)
+        if gid is None:
+            return 0
+        rows = supabase_client.update(
+            "user_guilds",
+            {"synced_at": "1970-01-01T00:00:00+00:00"},
+            filters={"guild_id": gid},
+        )
+        if rows:
+            log.info("Expired %d cached dashboard permission row(s) for guild %s", len(rows), gid)
+        return len(rows)
+
     def reconcile_bot_presence(self, present_ids: set[int]) -> None:
         """Make `guilds.bot_present` agree with reality.
 

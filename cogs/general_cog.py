@@ -189,6 +189,23 @@ class GeneralCog(commands.Cog, name="General"):
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member) -> None:
+        # Access is revoked before the log line: leaving (or being kicked/banned)
+        # must not leave a dashboard permission row behind. The bot's own gateway
+        # is the authority here, not a later browser sync.
+        if not member.bot:
+            try:
+                await asyncio.to_thread(
+                    self.config.revoke_dashboard_access, member.guild.id, member.id
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.error(
+                    "Failed to revoke dashboard access for %s in %s: %s",
+                    member.id,
+                    member.guild.id,
+                    exc,
+                    exc_info=True,
+                )
+
         emitter = getattr(self.bot, "emit_log", None)
         if emitter is None:
             return
@@ -200,6 +217,75 @@ class GeneralCog(commands.Cog, name="General"):
             actor_id=member.id,
             actor_name=str(member),
         )
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
+        """Revoke dashboard access the moment Manage Server is lost.
+
+        Discord fires this for role changes. Computing it from the permission
+        objects means role-additions, role-removals and role-permission edits are
+        all covered by one comparison.
+        """
+        if after.bot:
+            return
+
+        def manages(member: discord.Member) -> bool:
+            perms = member.guild_permissions
+            return bool(
+                perms.administrator or perms.manage_guild or member.guild.owner_id == member.id
+            )
+
+        if not manages(before) or manages(after):
+            return
+
+        try:
+            revoked = await asyncio.to_thread(
+                self.config.revoke_dashboard_access, after.guild.id, after.id
+            )
+            if revoked:
+                log.info(
+                    "Revoked dashboard access for %s (%s) in %s: lost Manage Server",
+                    after,
+                    after.id,
+                    after.guild.id,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "Failed to revoke dashboard access for %s in %s: %s",
+                after.id,
+                after.guild.id,
+                exc,
+                exc_info=True,
+            )
+
+    @commands.Cog.listener()
+    async def on_guild_role_update(
+        self, before: discord.Role, after: discord.Role
+    ) -> None:
+        """A role's permissions changed: every cached row for this guild is suspect."""
+        if before.permissions == after.permissions:
+            return
+        try:
+            await asyncio.to_thread(self.config.invalidate_dashboard_access, after.guild.id)
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "Failed to invalidate dashboard access for %s: %s",
+                after.guild.id,
+                exc,
+                exc_info=True,
+            )
+
+    @commands.Cog.listener()
+    async def on_guild_role_delete(self, role: discord.Role) -> None:
+        try:
+            await asyncio.to_thread(self.config.invalidate_dashboard_access, role.guild.id)
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "Failed to invalidate dashboard access for %s: %s",
+                role.guild.id,
+                exc,
+                exc_info=True,
+            )
 
     # ==================================================================
     # prefix dispatcher
