@@ -1280,27 +1280,171 @@ grant execute on function public.ai_trim_channel(bigint, bigint, integer) to aut
 
 
 -- ============================================================================
+-- 07b  OPERATOR / ADMIN TABLES
+-- ============================================================================
+-- Everything here backs the owner-only admin dashboard. It is deliberately
+-- RLS-on with NO policies: neither `anon` nor `authenticated` may touch these
+-- tables. The bot (service_role) reads and writes them, and the admin-api Edge
+-- Function (service_role, owner-gated) is the only browser-facing path.
+--
+-- WHY NOT is_dev() POLICIES LIKE ai_interactions HAS?
+--   These tables hold other people's private messages and the audit trail.
+--   Keeping them deny-all means a stolen dashboard JWT still cannot read them:
+--   there is no policy that could ever match, so the rows are simply invisible.
+--   The elevated read happens inside admin-api, behind the is_dev() check.
+
+
+-- ---------------------------------------------------------------------------
+-- guilds: live size snapshot, written by the bot
+-- ---------------------------------------------------------------------------
+-- online_count needs the privileged PRESENCE intent. When the bot cannot see
+-- presence it stays NULL rather than reporting a made-up 0.
+
+alter table public.guilds add column if not exists member_count     integer;
+alter table public.guilds add column if not exists online_count     integer;
+alter table public.guilds add column if not exists stats_updated_at timestamptz;
+
+comment on column public.guilds.member_count is
+    'Member count reported by Discord at the last stats snapshot. NULL = never sampled.';
+comment on column public.guilds.online_count is
+    'Members not offline at the last snapshot. NULL when the presence intent is unavailable.';
+
+
+-- ---------------------------------------------------------------------------
+-- bot_dms: incoming direct messages to the bot
+-- ---------------------------------------------------------------------------
+-- Storing DMs is NEW data collection and is disclosed in the Privacy Policy.
+-- `content` may be empty when the message carried only attachments.
+
+create table if not exists public.bot_dms (
+    id              bigserial primary key,
+    discord_user_id bigint not null,
+    username        text,
+    display_name    text,
+    content         text   not null default '',
+    attachments     jsonb  not null default '[]'::jsonb,
+    message_id      bigint,
+    created_at      timestamptz not null default now()
+);
+
+create index if not exists bot_dms_created_at_idx on public.bot_dms (created_at desc);
+create index if not exists bot_dms_user_idx       on public.bot_dms (discord_user_id, created_at desc);
+
+comment on table public.bot_dms is
+    'Incoming DMs to the bot, for the owner admin console. Operator-only via admin-api; disclosed in the Privacy Policy.';
+
+
+-- ---------------------------------------------------------------------------
+-- bot_dm_outbox: operator replies, sent by the bot
+-- ---------------------------------------------------------------------------
+-- The browser never holds the bot token. It queues a row here; the bot polls,
+-- sends, and records the outcome, so a send survives an admin tab closing.
+
+create table if not exists public.bot_dm_outbox (
+    id           bigserial primary key,
+    recipient_id bigint not null,
+    content      text   not null,
+    status       text   not null default 'pending',
+    error        text,
+    requested_by uuid references auth.users(id) on delete set null,
+    created_at   timestamptz not null default now(),
+    sent_at      timestamptz,
+
+    constraint bot_dm_outbox_status_valid check (status in ('pending','sent','failed'))
+);
+
+create index if not exists bot_dm_outbox_status_idx on public.bot_dm_outbox (status, created_at);
+
+comment on table public.bot_dm_outbox is
+    'Queued outbound DMs. The bot polls and sends them; status is pending -> sent | failed.';
+
+
+-- ---------------------------------------------------------------------------
+-- admin_audit: one row per operator write
+-- ---------------------------------------------------------------------------
+
+create table if not exists public.admin_audit (
+    id          bigserial primary key,
+    actor_id    uuid,
+    actor_label text,
+    action      text not null,
+    target      text,
+    detail      jsonb not null default '{}'::jsonb,
+    created_at  timestamptz not null default now()
+);
+
+create index if not exists admin_audit_created_at_idx on public.admin_audit (created_at desc);
+
+comment on table public.admin_audit is
+    'Append-only record of every admin-api write: who, what action, on which target.';
+
+
+-- ---------------------------------------------------------------------------
+-- admin_requests: work only the bot process can perform
+-- ---------------------------------------------------------------------------
+-- The Edge Function has no path to the Discord gateway, and rebuilding the
+-- command tree in TypeScript would duplicate the Python tree. So such a request
+-- is queued here and executed by the bot.
+
+create table if not exists public.admin_requests (
+    id           bigserial primary key,
+    kind         text  not null,
+    payload      jsonb not null default '{}'::jsonb,
+    status       text  not null default 'pending',
+    result       text,
+    requested_by uuid,
+    created_at   timestamptz not null default now(),
+    processed_at timestamptz,
+
+    constraint admin_requests_kind_valid   check (kind in ('resync_commands')),
+    constraint admin_requests_status_valid check (status in ('pending','done','failed'))
+);
+
+create index if not exists admin_requests_status_idx on public.admin_requests (status, created_at);
+
+comment on table public.admin_requests is
+    'Requests the Edge Function cannot perform itself. The bot polls and executes, then records the result.';
+
+
+-- ---------------------------------------------------------------------------
+-- RLS: deny-all. No policies are created on purpose.
+-- ---------------------------------------------------------------------------
+
+alter table public.bot_dms        enable row level security;
+alter table public.bot_dm_outbox  enable row level security;
+alter table public.admin_audit    enable row level security;
+alter table public.admin_requests enable row level security;
+
+alter table public.bot_dms        force row level security;
+alter table public.bot_dm_outbox  force row level security;
+alter table public.admin_audit    force row level security;
+alter table public.admin_requests force row level security;
+
+
+-- ============================================================================
 -- 08  VERIFICATION QUERIES
 -- ============================================================================
 -- Run these after the script to confirm everything landed.
 
--- 08.1 Tables exist (expect 11 rows)
+-- 08.1 Tables exist (expect 15 rows)
 -- select tablename
 --   from pg_tables
 --  where schemaname = 'public'
 --    and tablename in ('guilds','guild_settings','user_guilds',
 --                      'reply_actions','guild_replies','qotd_questions',
 --                      'ai_memory','ai_interactions','bot_events','dev_users',
---                      'user_preferences')
+--                      'user_preferences','bot_dms','bot_dm_outbox',
+--                      'admin_audit','admin_requests')
 --  order by tablename;
 
--- 08.2 RLS enabled on all 11 (expect rls_enabled = true everywhere)
+-- 08.2 RLS enabled on all 15 (expect rls_enabled = true everywhere)
 -- select relname as table_name, relrowsecurity as rls_enabled, relforcerowsecurity as rls_forced
 --   from pg_class
 --  where relname in ('guilds','guild_settings','user_guilds',
 --                    'reply_actions','guild_replies','qotd_questions',
 --                    'ai_memory','ai_interactions','bot_events','dev_users',
---                    'user_preferences');
+--                    'user_preferences','bot_dms','bot_dm_outbox',
+--                    'admin_audit','admin_requests');
 
 -- 08.3 Policy count per table (expect a sensible number, not 0)
 -- select tablename, count(*) as policy_count
@@ -1363,6 +1507,23 @@ grant execute on function public.ai_trim_channel(bigint, bigint, integer) to aut
 -- select policyname, cmd from pg_policies
 --  where schemaname = 'public' and tablename = 'user_preferences'
 --  order by policyname;
+
+-- 08.11 The operator tables are deny-all (expect ZERO rows for each).
+--       A policy appearing here means scope crept in and a logged-in user
+--       could read DMs or the audit trail directly.
+-- select tablename, count(*) as policy_count
+--   from pg_policies
+--  where schemaname = 'public'
+--    and tablename in ('bot_dms','bot_dm_outbox','admin_audit','admin_requests')
+--  group by tablename
+--  order by tablename;
+
+-- 08.12 Make your ADMIN account a dev (replacing the email). With Google or
+--       Discord sign-in alike, the account must exist in auth.users first, so
+--       sign in to admin_web once, then run this.
+-- insert into public.dev_users (user_id, note)
+-- select id, 'admin' from auth.users where email = 'you@example.com'
+-- on conflict (user_id) do nothing;
 
 -- ============================================================================
 -- END OF SCHEMA

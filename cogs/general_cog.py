@@ -84,6 +84,31 @@ class GeneralCog(commands.Cog, name="General"):
         """
         admin = is_admin(member)
 
+        # The prefix is per-guild (default "!"), so read the live value instead
+        # of hardcoding "!". Otherwise every example goes stale the moment an
+        # admin runs /config general prefix. In a DM there is no guild row, so
+        # the documented default is the only sensible value to show.
+        cfg = self.config.get(guild_id) if guild_id is not None else None
+        prefix = cfg.prefix if cfg is not None else "!"
+        prefix_enabled = cfg.prefix_enabled if cfg is not None else True
+        prefix_example = f"`{prefix}candy`"
+
+        if prefix_enabled:
+            prefix_help = (
+                f"The prefix is set to `{prefix}` (the default is `!`). "
+                + (
+                    "Change it with `/config general prefix`."
+                    if admin
+                    else "An admin can change it with `/config general prefix`."
+                )
+            )
+        else:
+            prefix_help = (
+                f"Prefix commands are **off** on this server, so `{prefix}` "
+                "commands are ignored. Slash commands still work; an admin can "
+                "turn text commands on with `/config general prefixcommands`."
+            )
+
         embed = discord.Embed(
             title="🍬 Candy's Command List",
             description=(
@@ -95,13 +120,20 @@ class GeneralCog(commands.Cog, name="General"):
         )
 
         embed.add_field(
+            name="⌨️ Prefix",
+            value=prefix_help,
+            inline=False,
+        )
+
+        embed.add_field(
             name="💬 General",
             value=(
                 "`/hello` - say hi to me\n"
                 "`/help` - show this menu\n"
                 "`/ask` - ask me anything\n"
-                "`@Candy` or `!candy` - chat with me\n"
-                "`!candyp` - same, but I weigh your own history too"
+                f"`@Candy` or {prefix_example} - chat with me\n"
+                f"`{prefix}candyp` - same, but I weigh your own history too\n"
+                f"`{prefix}help` - this menu as a text command"
             ),
             inline=False,
         )
@@ -134,7 +166,7 @@ class GeneralCog(commands.Cog, name="General"):
                     "`/config chat` - AI model, prompt, channels, memory\n"
                     "`/config replies` - customise fun action replies\n"
                     "`/config qotd` - Question of the Day\n"
-                    "`!memory on|off` - toggle the AI's memory"
+                    f"`{prefix}memory on|off` - toggle the AI's memory"
                 ),
                 inline=False,
             )

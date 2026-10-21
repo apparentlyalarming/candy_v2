@@ -60,6 +60,14 @@ class Settings:
     enable_realtime: bool = True
     dev_guild_ids: tuple[int, ...] = field(default_factory=tuple)
 
+    # --- Admin bridge (owner admin dashboard) ------------------------------
+    # Publishes guild size snapshots, drains the DM outbox, and runs queued
+    # admin requests. Turn off to run the bot with no admin wiring at all.
+    admin_bridge_enabled: bool = True
+    # Separate from the bridge because it is the privacy-sensitive half: when
+    # true the bot stores every DM it receives (see the Privacy Policy).
+    capture_dms: bool = True
+
     # --- Host rotation reminder --------------------------------------------
     # bot-hosting.net's free tier requires a manual renewal every 4 days or the
     # bot is stopped. This is measured in DAYS SINCE THE LAST RESTART (see
@@ -120,6 +128,8 @@ def load_settings() -> Settings:
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         log_file=os.getenv("LOG_FILE", "logs/candy.log"),
         enable_realtime=_get_bool("ENABLE_REALTIME", True),
+        admin_bridge_enabled=_get_bool("ADMIN_BRIDGE_ENABLED", True),
+        capture_dms=_get_bool("CAPTURE_DMS", True),
         rotation_reminder_days=_get_float("ROTATION_REMINDER_DAYS", 3.0),
         dev_guild_ids=tuple(dev_guild_ids),
     )

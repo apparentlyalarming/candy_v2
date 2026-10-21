@@ -27,6 +27,7 @@ from discord.ext import commands
 
 from config import settings
 from db import realtime
+from services.admin_bridge import AdminBridge
 from services.config_service import ConfigService
 from services.groq_service import GroqService
 from services.rotation_reminder import RenewalButtonView, RotationReminder, build_reminder
@@ -50,13 +51,14 @@ COGS = [
     "cogs.fun_cog",
     "cogs.qotd_cog",
     "cogs.ai_cog",
+    "cogs.admin_cog",
 ]
 
 
 class CandyBot(commands.Bot):
     """discord.py client with the shared services attached."""
 
-    def __init__(self, repair_mode: bool = False) -> None:
+    def __init__(self, repair_mode: bool = False, presence_intent: bool = True) -> None:
         """repair_mode builds the command tree and nothing else.
 
         Used by the --clear-commands / CLEAR_COMMANDS one-shot repair. In that
@@ -65,15 +67,24 @@ class CandyBot(commands.Bot):
         rewrite Discord's registrations, then exits. Starting real services here
         would leak background tasks and, worse, run a NORMAL sync before the
         clear - which is the very thing the repair is undoing.
+
+        presence_intent is split out because the PRESENCE intent is privileged:
+        enabling it in code while it is OFF in the Developer Portal makes login
+        fail outright (PrivilegedIntentsRequired). main() retries with it off so
+        a missing portal toggle degrades online-counts to NULL instead of
+        taking the whole bot down.
         """
         self.repair_mode = repair_mode
 
         # Intents: message_content enables prefix commands (!hug). members is
         # enabled because prefix-command admin checks read guild_permissions.
+        # presences powers the admin dashboard's online-count; when it is off,
+        # every member reports as offline, so the honest value is NULL.
         intents = discord.Intents.default()
         intents.message_content = True
         intents.members = True
         intents.guilds = True
+        intents.presences = presence_intent
 
         super().__init__(
             command_prefix=self._prefix_resolver,
@@ -87,6 +98,10 @@ class CandyBot(commands.Bot):
         self.groq_service: GroqService | None = None
         self.realtime_listener: realtime.RealtimeListener | None = None
         self.rotation_reminder: RotationReminder | None = None
+        # Owner admin dashboard wiring. admin_bridge is the background worker;
+        # capture_dms is read by cogs/admin_cog.py on every incoming DM.
+        self.admin_bridge: AdminBridge | None = None
+        self.capture_dms: bool = settings.capture_dms
 
     async def _prefix_resolver(self, bot: commands.Bot, message: discord.Message) -> list[str]:
         """Return a prefix the built-in processor can never match.
@@ -139,6 +154,14 @@ class CandyBot(commands.Bot):
         # 4. Event logging (log channel + dashboard feed).
         emitter = make_emitter(self)
         self.emit_log = emitter  # type: ignore[attr-defined]
+
+        # 4b. Admin bridge: guild-size snapshots, the DM outbox, and queued
+        #     admin requests. DM capture is gated separately by CAPTURE_DMS.
+        if settings.admin_bridge_enabled:
+            self.admin_bridge = AdminBridge(self)
+            self.admin_bridge.start()
+        else:
+            log.warning("Admin bridge is disabled; the admin dashboard will not update")
 
         # 5. Host rotation reminder. The host is bot-hosting.net, whose free tier
         #    stops the bot unless renewed every 4 days; the bot cannot read that
@@ -349,6 +372,10 @@ class CandyBot(commands.Bot):
             with contextlib.suppress(Exception):
                 await self.realtime_listener.stop()
 
+        if self.admin_bridge is not None:
+            with contextlib.suppress(Exception):
+                await self.admin_bridge.stop()
+
         if self.rotation_reminder is not None:
             with contextlib.suppress(Exception):
                 await self.rotation_reminder.stop()
@@ -396,14 +423,30 @@ async def main() -> None:
         log.warning("Repair mode finished. REMOVE CLEAR_COMMANDS / --clear-commands now.")
         return
 
-    async with bot:
-        try:
-            await bot.start(settings.discord_token)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            if not bot.is_closed():
-                await bot.close()
+    async def _run(instance: CandyBot) -> None:
+        async with instance:
+            try:
+                await instance.start(settings.discord_token)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                if not instance.is_closed():
+                    await instance.close()
+
+    try:
+        await _run(bot)
+    except discord.PrivilegedIntentsRequired:
+        # The PRESENCE intent is on in code but OFF in the Developer Portal, so
+        # Discord refused the login. Retry without it rather than leaving the
+        # bot dead: online-counts degrade to NULL, everything else works.
+        log.error(
+            "Presence intent is enabled in code but NOT in the Developer Portal, "
+            "so login was refused. Restarting WITHOUT it - online counts read as "
+            "NULL until you enable it (Developer Portal -> Bot -> Privileged "
+            "Gateway Intents -> Presence)."
+        )
+        bot = CandyBot(repair_mode=False, presence_intent=False)
+        await _run(bot)
 
 
 if __name__ == "__main__":
