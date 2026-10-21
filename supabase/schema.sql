@@ -1526,6 +1526,19 @@ alter table public.admin_requests force row level security;
 -- select id, 'admin' from auth.users where email = 'you@example.com'
 -- on conflict (user_id) do nothing;
 
+-- 08.13 Every 64-bit column in public (expect the list below). The admin
+--       console's read-only table browser casts each of these to text, because
+--       PostgREST would otherwise send a Discord snowflake as a JSON number and
+--       the browser would round it. If a new bigint column appears here it must
+--       also be added to BIGINT_COLUMNS / BIGINT_ARRAY_COLUMNS in
+--       supabase/functions/admin-api/index.ts, or the explorer will show ids
+--       that are off by a few hundred.
+-- select table_name, column_name, data_type
+--   from information_schema.columns
+--  where table_schema = 'public'
+--    and data_type in ('bigint','bigint[]')
+--  order by table_name, ordinal_position;
+
 -- ============================================================================
 -- END OF SCHEMA
 -- ============================================================================

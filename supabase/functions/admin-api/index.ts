@@ -93,6 +93,99 @@ const GUILD_SELECT =
   "id::text,name,icon_url,bot_present,member_count,online_count,stats_updated_at,created_at," +
   "guild_settings(ai_enabled,qotd_enabled,prefix,updated_at)";
 
+// `*` plus the two bigint[] columns read a second time as text. PostgREST
+// serialises bigint as a JSON number, and a Discord snowflake is past 2^53, so
+// an id inside these arrays arrives rounded (…333 becomes …400). The form would
+// then display the wrong channel and saving it would write the rounded value
+// back, silently retargeting the AI. Postgres renders int8[] as "{123,456}",
+// which parseBigintArrayText turns back into exact strings.
+const SETTINGS_SELECT =
+  "*,ai_channel_ids_text:ai_channel_ids::text," +
+  "ai_memory_ignored_channels_text:ai_memory_ignored_channels::text";
+
+function parseBigintArrayText(value: unknown): string[] | null {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  const body = text.startsWith("{") && text.endsWith("}") ? text.slice(1, -1) : text;
+  if (body.trim() === "") return [];
+  return body
+    .split(",")
+    .map((part) => part.trim().replace(/^"|"$/g, ""))
+    .filter(Boolean);
+}
+
+/** Make a guild_settings row safe to send to a browser with 64-bit ids intact. */
+function settingsForClient(data: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...data };
+  if (typeof out.guild_id === "number" || typeof out.guild_id === "string") {
+    out.guild_id = String(out.guild_id);
+  }
+  for (const column of BIGINT_ARRAY_COLUMNS.guild_settings) {
+    const alias = `${column}_text`;
+    if (alias in out) {
+      out[column] = parseBigintArrayText(out[alias]);
+      delete out[alias];
+    }
+  }
+  return out;
+}
+
+// 64-bit columns, per table, for the read-only explorer. PostgREST renders
+// bigint as a JSON number and the browser parses that as a double, so every
+// Discord snowflake past 2^53 would arrive rounded - the explorer would show
+// ids that do not exist. It therefore asks for each of these a second time as
+// text and swaps it into the row before answering. schema.sql verification 08.13
+// lists every bigint column in public; this map must cover all of them.
+const BIGINT_COLUMNS: Record<string, string[]> = {
+  guilds: ["id"],
+  guild_settings: ["guild_id", "log_channel_id", "qotd_channel_id", "qotd_role_id"],
+  user_guilds: ["guild_id", "permissions"],
+  profiles: ["discord_user_id"],
+  guild_replies: ["guild_id"],
+  qotd_questions: ["id", "guild_id", "asked_message_id"],
+  ai_memory: ["id", "guild_id", "channel_id", "discord_user_id"],
+  ai_interactions: ["id", "guild_id", "channel_id", "discord_user_id"],
+  bot_events: ["id", "guild_id", "actor_id", "channel_id"],
+  bot_dms: ["id", "discord_user_id", "message_id"],
+  bot_dm_outbox: ["id", "recipient_id"],
+  admin_audit: ["id"],
+  admin_requests: ["id"],
+};
+
+const BIGINT_ARRAY_COLUMNS: Record<string, string[]> = {
+  guild_settings: ["ai_channel_ids", "ai_memory_ignored_channels"],
+};
+
+function explorerSelect(table: string): string {
+  const casts = [
+    ...(BIGINT_COLUMNS[table] ?? []),
+    ...(BIGINT_ARRAY_COLUMNS[table] ?? []),
+  ].map((column) => `${column}_text:${column}::text`);
+  return casts.length ? `*,${casts.join(",")}` : "*";
+}
+
+function explorerRows(table: string, rows: Record<string, unknown>[]): Record<string, unknown>[] {
+  const scalar = BIGINT_COLUMNS[table] ?? [];
+  const arrays = BIGINT_ARRAY_COLUMNS[table] ?? [];
+  if (scalar.length === 0 && arrays.length === 0) return rows;
+  return rows.map((row) => {
+    const out = { ...row };
+    for (const column of scalar) {
+      if (`${column}_text` in out) {
+        out[column] = out[`${column}_text`];
+        delete out[`${column}_text`];
+      }
+    }
+    for (const column of arrays) {
+      if (`${column}_text` in out) {
+        out[column] = parseBigintArrayText(out[`${column}_text`]);
+        delete out[`${column}_text`];
+      }
+    }
+    return out;
+  });
+}
+
 function errorResponse(status: number, code: string, message: string): Response {
   return new Response(JSON.stringify({ error: { code, message } }), {
     status,
@@ -248,10 +341,13 @@ Deno.serve(async (req: Request): Promise<Response> => {
               .order("created_at", { ascending: false })
               .limit(8),
             service.from("ai_interactions")
-              .select("succeeded,latency_ms,prompt_tokens,completion_tokens,error_kind")
+              .select("model,succeeded,latency_ms,prompt_tokens,completion_tokens,error_kind")
               .gte("created_at", since7)
               .limit(50_000),
           ]);
+        const ai7 = await count(() =>
+          service.from("ai_interactions").select("*", { count: "exact", head: true }).gte("created_at", since7)
+        );
 
         if (guildsRes.error) return errorResponse(500, "db_error", guildsRes.error.message);
         const guilds = (guildsRes.data ?? []) as Record<string, unknown>[];
@@ -274,7 +370,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
           events: { last24h: events24, errors24h: errors24 },
           ai: {
             last24h: ai24,
-            last7d: rows.length,
+            last7d: ai7,
+            sampled7d: rows.length,
             successRate7d: rows.length ? Math.round((ok7 / rows.length) * 1000) / 10 : null,
             avgLatencyMs7d: lat.length ? Math.round(lat.reduce((a, b) => a + b, 0) / lat.length) : null,
             byModel,
@@ -298,7 +395,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
         if (!gid) return errorResponse(400, "bad_guild_id", "guild_id must be a snowflake.");
         const [guild, settings, events, ai, memory, replies, qotd] = await Promise.all([
           service.from("guilds").select(GUILD_SELECT).eq("id", gid).maybeSingle(),
-          service.from("guild_settings").select("*").eq("guild_id", gid).maybeSingle(),
+          service.from("guild_settings").select(SETTINGS_SELECT).eq("guild_id", gid).maybeSingle(),
           service.from("bot_events").select("*", { count: "exact", head: true }).eq("guild_id", gid),
           service.from("ai_interactions").select("*", { count: "exact", head: true }).eq("guild_id", gid),
           service.from("ai_memory").select("*", { count: "exact", head: true }).eq("guild_id", gid),
@@ -306,9 +403,10 @@ Deno.serve(async (req: Request): Promise<Response> => {
           service.from("qotd_questions").select("*", { count: "exact", head: true }).eq("guild_id", gid),
         ]);
         if (guild.error) return errorResponse(500, "db_error", guild.error.message);
-        // guild_settings.guild_id is a bigint; normalise it to a string so the
-        // browser never has to hold a value past Number.MAX_SAFE_INTEGER.
-        const settingsRow = settings.data ? { ...settings.data, guild_id: String(settings.data.guild_id) } : null;
+        if (settings.error) return errorResponse(500, "db_error", settings.error.message);
+        const settingsRow = settings.data
+          ? settingsForClient(settings.data as Record<string, unknown>)
+          : null;
         return json({
           guild: guild.data,
           settings: settingsRow,
@@ -334,7 +432,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
           .from("guild_settings")
           .update(payload)
           .eq("guild_id", gid)
-          .select("*")
+          .select(SETTINGS_SELECT)
           .maybeSingle();
         if (error) {
           const status = error.code === "23514" || error.code === "22001" || error.code === "22003" ? 400 : 500;
@@ -342,7 +440,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
         }
         if (!data) return errorResponse(404, "settings_missing", "No settings row for that server yet.");
         await audit("guilds.update", gid, { columns: Object.keys(payload) });
-        return json({ settings: { ...data, guild_id: String(data.guild_id) } });
+        return json({ settings: settingsForClient(data as Record<string, unknown>) });
       }
 
       // ------------------------------------------------------------------
@@ -684,20 +782,29 @@ Deno.serve(async (req: Request): Promise<Response> => {
         const uid = asSnowflake(params.discord_user_id);
         if (!uid) return errorResponse(400, "bad_user_id", "discord_user_id must be a snowflake.");
         const limit = clampInt(params.limit, 1, 500, 200);
-        const { data, error } = await service
+        // Newest first + reverse: a long thread must show its LATEST turns, not
+        // its first 200. The counts let the UI admit when it is showing a slice.
+        const { data, error, count } = await service
           .from("bot_dms")
-          .select("id,discord_user_id::text,username,display_name,content,attachments,created_at")
+          .select("id,discord_user_id::text,username,display_name,content,attachments,created_at", {
+            count: "exact",
+          })
           .eq("discord_user_id", uid)
-          .order("created_at", { ascending: true })
+          .order("created_at", { ascending: false })
           .limit(limit);
         if (error) return errorResponse(500, "db_error", error.message);
-        const { data: outgoing } = await service
+        const { data: outgoing, count: outgoingCount } = await service
           .from("bot_dm_outbox")
-          .select("id,recipient_id::text,content,status,error,created_at,sent_at")
+          .select("id,recipient_id::text,content,status,error,created_at,sent_at", { count: "exact" })
           .eq("recipient_id", uid)
-          .order("created_at", { ascending: true })
+          .order("created_at", { ascending: false })
           .limit(limit);
-        return json({ incoming: data ?? [], outgoing: outgoing ?? [] });
+        return json({
+          incoming: (data ?? []).slice().reverse(),
+          outgoing: (outgoing ?? []).slice().reverse(),
+          incoming_total: count ?? null,
+          outgoing_total: outgoingCount ?? null,
+        });
       }
 
       case "dms.send": {
@@ -731,11 +838,18 @@ Deno.serve(async (req: Request): Promise<Response> => {
         if (!meta) return errorResponse(400, "bad_table", "That table is not in the explorer allowlist.");
         const limit = clampInt(params.limit, 1, 200, 50);
         const offset = clampInt(params.offset, 0, 1_000_000, 0);
-        let q = service.from(table).select("*", { count: "exact" }).range(offset, offset + limit - 1);
+        let q = service
+          .from(table)
+          .select(explorerSelect(table), { count: "exact" })
+          .range(offset, offset + limit - 1);
         if (meta.order) q = q.order(meta.order, { ascending: meta.asc ?? false });
         const { data, error, count } = await q;
         if (error) return errorResponse(500, "db_error", error.message);
-        return json({ table, rows: data ?? [], total: count ?? null });
+        return json({
+          table,
+          rows: explorerRows(table, (data ?? []) as Record<string, unknown>[]),
+          total: count ?? null,
+        });
       }
 
       // ------------------------------------------------------------------
