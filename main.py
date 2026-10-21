@@ -247,41 +247,58 @@ class CandyBot(commands.Bot):
             n = await self.tree.sync(guild=guild)
             log.info("Cleared guild scope %s; Discord now holds %d commands", guild_id, len(n))
 
-        # 4) Put the commands back, then re-register. Skip step 1's branch in
-        #    _sync_commands by doing the copy explicitly for the dev guilds.
+        # 4) Put the commands back and re-register them in BOTH scopes. The
+        #    global sync covers every non-dev server, so it must always run -
+        #    confining the restore to dev guilds is what left the global scope
+        #    empty for everyone else.
         for cmd in snapshot:
             self.tree.add_command(cmd)
 
-        if settings.dev_guild_ids:
-            for guild_id in settings.dev_guild_ids:
-                guild = discord.Object(id=guild_id)
-                self.tree.copy_global_to(guild=guild)
-                n = await self.tree.sync(guild=guild)
-                log.info("Re-registered %d commands to guild %s", len(n), guild_id)
-        else:
-            n = await self.tree.sync()
-            log.info("Re-registered %d commands globally", len(n))
+        n = await self.tree.sync()
+        log.info("Re-registered %d commands globally", len(n))
+
+        for guild_id in settings.dev_guild_ids:
+            guild = discord.Object(id=guild_id)
+            self.tree.copy_global_to(guild=guild)
+            n = await self.tree.sync(guild=guild)
+            log.info("Re-registered %d commands to guild %s", len(n), guild_id)
 
         log.info("Clear-and-resync complete")
 
     async def _sync_commands(self) -> None:
-        """Sync the app command tree.
+        """Sync the app command tree to EVERY scope that needs it.
 
-        Cloning to specific dev guilds when DEV_GUILD_IDS is set gives instant
-        command updates; a global sync can take up to an hour to propagate.
+        THE GLOBAL SYNC IS NOT OPTIONAL. It is what makes commands exist in every
+        server that has the bot - the actual product behaviour. Setting
+        DEV_GUILD_IDS must not switch that off.
+
+            This method used to treat the two scopes as an either/or: when
+            DEV_GUILD_IDS was set it synced ONLY to those guilds and never
+            globally. The global scope was therefore left empty, so every other
+            server - including the operator's own - saw NO slash commands at all
+            (not just /config). Verified against Discord: 0 global commands and
+            17 in the single dev guild.
+
+        Dev guilds are synced IN ADDITION, not instead: guild registrations
+        apply instantly while a changed global command can take up to an hour to
+        propagate. Same tree in both scopes, so there are no stale copies.
         """
         try:
-            if settings.dev_guild_ids:
-                for guild_id in settings.dev_guild_ids:
-                    guild = discord.Object(id=guild_id)
-                    self.tree.copy_global_to(guild=guild)
-                    synced = await self.tree.sync(guild=guild)
-                    log.info("Synced %d commands to dev guild %s", len(synced), guild_id)
-            else:
-                synced = await self.tree.sync()
-                log.info("Synced %d commands globally", len(synced))
+            synced = await self.tree.sync()
+            log.info("Synced %d commands globally", len(synced))
         except Exception as exc:
-            log.error("Command sync failed: %s", exc, exc_info=True)
+            log.error("Global command sync failed: %s", exc, exc_info=True)
+
+        for guild_id in settings.dev_guild_ids:
+            guild = discord.Object(id=guild_id)
+            self.tree.copy_global_to(guild=guild)
+            try:
+                synced = await self.tree.sync(guild=guild)
+                log.info("Synced %d commands to dev guild %s", len(synced), guild_id)
+            except Exception as exc:
+                log.error(
+                    "Command sync to dev guild %s failed: %s", guild_id, exc, exc_info=True
+                )
 
     # ------------------------------------------------------------------
 
