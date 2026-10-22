@@ -775,9 +775,14 @@ Deno.serve(async (req: Request): Promise<Response> => {
             existing.sampled_count += 1;
           }
         }
+        // Reading DM content is a privacy-sensitive act: record it like every
+        // other operator action (PRIVACY_POLICY: "every such read is recorded").
+        await audit("dms.threads.read", null, {
+          threads: threads.size,
+          sampled: (data ?? []).length,
+        });
         return json({ threads: [...threads.values()], total_messages: count ?? null, sampled: (data ?? []).length });
       }
-
       case "dms.messages": {
         const uid = asSnowflake(params.discord_user_id);
         if (!uid) return errorResponse(400, "bad_user_id", "discord_user_id must be a snowflake.");
@@ -799,6 +804,11 @@ Deno.serve(async (req: Request): Promise<Response> => {
           .eq("recipient_id", uid)
           .order("created_at", { ascending: false })
           .limit(limit);
+        await audit("dms.messages.read", uid, {
+          limit,
+          incoming_total: count ?? 0,
+          outgoing_total: outgoingCount ?? 0,
+        });
         return json({
           incoming: (data ?? []).slice().reverse(),
           outgoing: (outgoing ?? []).slice().reverse(),

@@ -94,14 +94,24 @@ class GeneralCog(commands.Cog, name="General"):
         prefix_example = f"`{prefix}candy`"
 
         if prefix_enabled:
-            prefix_help = (
-                f"The prefix is set to `{prefix}` (the default is `!`). "
-                + (
-                    "Change it with `/config general prefix`."
-                    if admin
-                    else "An admin can change it with `/config general prefix`."
+            if cfg is None:
+                # DM / no guild row: talk about the default rather than a
+                # non-existent "this server".
+                prefix_help = (
+                    "Prefix commands use `!` by default; each server can set its own."
                 )
-            )
+            else:
+                if prefix == "!":
+                    prefix_help = "This server uses the default prefix, `!`."
+                else:
+                    prefix_help = (
+                        f"This server's prefix is `{prefix}` - an admin set it."
+                    )
+                prefix_help += (
+                    " Change it with `/config general prefix`."
+                    if admin
+                    else " An admin can change it with `/config general prefix`."
+                )
         else:
             prefix_help = (
                 f"Prefix commands are **off** on this server, so `{prefix}` "
