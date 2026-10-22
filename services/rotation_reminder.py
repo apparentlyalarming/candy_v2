@@ -214,8 +214,15 @@ class RenewalButtonView(discord.ui.View):
 
         # Edit the original message in place rather than sending a new one: the
         # button has served its purpose and must not be clicked twice by mistake.
+        # The panel link stays on the replacement because a Discord button cannot
+        # both reset (a callback) and navigate (a link) - so resetting leaves the
+        # owner one click from the place they actually renew.
         embed = reminder._build_embed(0.0, acknowledged_at=moment)
-        embed.title = "✅ Renewal recorded"
+        embed.title = "✅ Countdown reset"
+        embed.description = (
+            "The renewal clock restarted. If you have not renewed the plan "
+            "yet, open the panel below to finish before its window closes."
+        )
         embed.colour = discord.Colour.green()
 
         view = discord.ui.View(timeout=None)
@@ -298,6 +305,88 @@ class RotationReminder:
     @property
     def last_tick(self) -> datetime | None:
         return self._last_tick
+
+    @property
+    def last_sent_at(self) -> datetime | None:
+        return self._last_sent_at
+
+    def elapsed_days(self, now: datetime | None = None) -> float | None:
+        """Days since the recorded boot, or None before the clock is known."""
+        if self._boot_time is None:
+            return None
+        return days_elapsed(self._boot_time, now or datetime.now(timezone.utc))
+
+    def next_reminder_at(self, now: datetime | None = None) -> datetime | None:
+        """When the next reminder is actually due to be delivered.
+
+        Mirrors the loop rather than just the threshold: once the clock is past
+        it, the next send lands at ``last_sent_at + RESEND_EVERY``, so an owner
+        asking immediately after a reminder does not see "due now" and assume
+        the schedule is stuck.
+        """
+        if self._threshold_days <= 0 or self._boot_time is None:
+            return None
+
+        moment = now or datetime.now(timezone.utc)
+        due = self._boot_time + timedelta(days=self._threshold_days)
+        if moment < due:
+            return due
+        if self._last_sent_at is None:
+            return moment
+        return max(moment, self._last_sent_at + RESEND_EVERY)
+
+    def status_embed(self, now: datetime | None = None) -> discord.Embed:
+        """Owner-facing "where is the clock" summary for ``/config dev status``.
+
+        Deliberately separate from ``_build_embed``: that one is the alarm and
+        reads like one. This one answers a question and is only shown on demand.
+        """
+        moment = now or datetime.now(timezone.utc)
+        boot = self._boot_time
+        elapsed = self.elapsed_days(moment) if boot is not None else None
+        next_at = self.next_reminder_at(moment)
+
+        if elapsed is None:
+            description = "The renewal clock has not started yet."
+        elif is_due(boot, moment, self._threshold_days):
+            description = (
+                "The renewal is **due now**. Press **I've renewed** once the "
+                "plan is renewed, or open the panel below."
+            )
+        else:
+            description = (
+                "bot-hosting.net's free tier stops this bot unless the plan is "
+                "renewed **every 4 days**."
+            )
+
+        embed = discord.Embed(
+            title="🔁 Host renewal status",
+            description=description,
+            colour=discord.Colour.orange(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(
+            name="Running for",
+            value=f"{elapsed:.1f} day(s)" if elapsed is not None else "unknown",
+            inline=True,
+        )
+        embed.add_field(
+            name="Reminder set at",
+            value=f"{self._threshold_days:.1f} day(s)",
+            inline=True,
+        )
+        if next_at is not None:
+            # <t:...:R> renders as "in 2 days" in the reader's locale.
+            value = "due now" if next_at <= moment else f"<t:{int(next_at.timestamp())}:R>"
+            embed.add_field(name="Next reminder", value=value, inline=True)
+        if boot is not None:
+            embed.add_field(
+                name="Clock started",
+                value=f"<t:{int(boot.timestamp())}:f>",
+                inline=False,
+            )
+        embed.set_footer(text="candy_v2 · host rotation")
+        return embed
 
     def mark_renewed(self, now: datetime | None = None) -> datetime:
         """Externally reset the clock (e.g. after a manual renewal)."""

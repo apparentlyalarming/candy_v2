@@ -30,6 +30,7 @@ from discord.ext import commands
 from cogs import bind_group_commands
 from services.config_service import ConfigError, ConfigService
 from services.render import preview
+from services.rotation_reminder import RenewalButtonView
 from utils.logging_setup import get_logger
 
 log = get_logger("cogs.config")
@@ -617,6 +618,40 @@ class ConfigCog(commands.Cog, name="Config"):
         if info.team is not None:
             return any(m.id == interaction.user.id for m in info.team.members)
         return info.owner is not None and info.owner.id == interaction.user.id
+
+    @app_commands.command(
+        name="renewal",
+        description="Bot owner: time until the next host-renewal reminder.",
+    )
+    async def renewal(self, interaction: discord.Interaction) -> None:
+        """Top-level on purpose: /config is gated by Manage Server in Discord.
+
+        Discord applies default permissions per top-level command, so an owner
+        without Manage Server would never see a subcommand under /config - which
+        defeats a check that is supposed to work anywhere.
+        """
+        if not await self._is_bot_owner(interaction):
+            await interaction.response.send_message(
+                "That command is for the bot owner only.", ephemeral=True
+            )
+            return
+
+        reminder = getattr(interaction.client, "rotation_reminder", None)
+        if reminder is None:
+            await interaction.response.send_message(
+                "The renewal reminder is disabled "
+                "(`ROTATION_REMINDER_DAYS=0`).",
+                ephemeral=True,
+            )
+            return
+
+        # Same persistent view as the reminder DM. One reset path, and the
+        # countdown can be restarted from here without hunting for the DM.
+        await interaction.response.send_message(
+            embed=reminder.status_embed(),
+            view=RenewalButtonView(reminder),
+            ephemeral=True,
+        )
 
     @dev_group.command(
         name="renewed",
