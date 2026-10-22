@@ -3,7 +3,8 @@
 A Discord bot with per-server config (stored in Supabase), Groq-powered AI chat,
 randomised fun action replies, and a Question of the Day queue.
 
-The dashboard that edits the same config is a separate repo: `candy_web`.
+The companion dashboard is a separate repo: `candy_web`. It reads and writes the
+same Supabase project, so there is one schema and one source of truth.
 
 ---
 
@@ -52,23 +53,33 @@ python main.py
 
 ## Deploying
 
-The bot and the Edge Function deploy **separately**.
+The bot and the Edge Functions deploy **separately**.
 
 **Bot** — bot-hosting.net pulls this repo. Set the variables from `.env.example`
 in the host panel, then deploy.
 
-**Edge Function** — must be deployed from your machine, once:
+**Edge Functions** — deployed from your machine, once. The bot calls only
+`chat` for AI replies. The dashboard also calls `apply-guild-settings` (settings
+writes), `sync-guilds` (guild and permission refresh) and `delete-account`
+(self-service erasure).
 
 ```bash
 supabase login
 supabase link --project-ref <YOUR_PROJECT_REF>
+
+# Secrets used by the functions, never by the bot process itself.
 supabase secrets set GROQ_API_KEY=gsk_...
 supabase secrets set BOT_SERVICE_KEY=<the bot's SUPABASE_SERVICE_KEY value>
+supabase secrets set DISCORD_BOT_TOKEN=<the bot token>
+
 supabase functions deploy chat --use-api
+supabase functions deploy apply-guild-settings --use-api
+supabase functions deploy sync-guilds --use-api
+supabase functions deploy delete-account --use-api
 ```
 
 `--use-api` bundles server-side and avoids Docker/Podman issues on
-SELinux-enforcing hosts. The function must stay named **`chat`** — the bot
+SELinux-enforcing hosts. The AI function must stay named **`chat`** — the bot
 hardcodes `{SUPABASE_URL}/functions/v1/chat`.
 
 `BOT_SERVICE_KEY` is the exact service-role key the bot sends. The function
@@ -90,14 +101,15 @@ Everything is editable from **both** Discord and the dashboard. In Discord:
 | Command | Purpose |
 |---|---|
 | `/config status` | Current server setup at a glance |
-| `/config general` | Prefix, prefix toggle, log channel, log events, log toggle |
+| `/config general` | Prefix, prefix commands toggle, log channel, log events, log toggle |
 | `/config chat` | AI toggle, model, system prompt, channels, context, memory, memory window, ignored channels, cooldown, temperature, max tokens |
 | `/config replies` | List, add, remove, toggle, reset fun action replies |
 | `/config qotd` | Toggle, time, timezone, channel, role, days, add, list, remove, next, skip |
 | `/config dev renewed` | Bot owner only. Resets the host-renewal reminder clock. |
 All `/config` subcommands require **Manage Server**, except `/config dev renewed`
 which requires being the **bot owner** — the host renewal is an account-level
-concern, not a per-server setting.
+concern, not a per-server setting. `/renewal` is top-level for the same reason:
+an owner without Manage Server would not see it under `/config`.
 
 ---
 
@@ -105,15 +117,21 @@ concern, not a per-server setting.
 
 | Command | Notes |
 |---|---|
-| `/ask <prompt>` | Ask the AI. Also works on the dashboard. |
+| `/renewal` | Bot owner only. Host-renewal countdown with a reset button. |
+| `/ask <prompt>` | Ask the AI. The dashboard has a prompt tester for the same AI path. |
 | `@Candy <message>` | AI reply when the channel is allowed. |
 | `!candy <message>` | Same as a mention, as a prefix command. |
 | `!candyp <message>` | Personalized: also weighs the prompter's own recent history. |
+| `!help` | The same role-aware menu as `/help`, as a text command. |
 | `/hello`, `/help` | General. |
 | `/hug`, `/punch`, `/kick`, ... | Fun actions. Every one also works as `!hug`, etc. |
 
 Fun replies are chosen at random from a per-action list. Guilds can override the
 defaults, and a guild override takes precedence over the catalog default.
+
+Prefix examples above use the default `!`. The prefix is configurable per server
+(`/config general prefix`), and `/help` and `!help` always show the server's live
+value rather than assuming `!`.
 
 Prefix commands are opt-out per guild and target the same code path as the slash
 equivalents.
@@ -148,7 +166,15 @@ are closed the reminder falls back to each guild's log channel, and an
 account-level row is written to `bot_events` for the dashboard feed.
 
 `/config dev renewed` (bot owner only) does the same thing from slash commands,
-for when the DM has scrolled away.
+for when the DM has scrolled away. `/renewal` shows the same clock on demand —
+days running, the threshold, and the next reminder as a Discord relative
+timestamp — and carries the same reset button.
+
+A Discord button cannot both reset the clock (a callback) and open a URL (a link
+button), so the reminder keeps two: **I've renewed** resets, and **Open
+bot-hosting panel** navigates. After a reset the message is rewritten as a
+confirmation with the panel link still attached, which is the closest a single
+click can get to "renew and reset".
 
 ### The button survives restarts
 
@@ -248,6 +274,8 @@ recalled:
 /config chat memory off  # slash equivalent
 ```
 
+Replace `!` with your server's prefix; `/help` shows the current one.
+
 Memory off means the AI **neither reads nor writes** anything. It still answers, but
 every reply is made with no knowledge of past chat, and nothing new is recorded.
 
@@ -277,7 +305,10 @@ services/                 Config writes, Groq client, rendering, QOTD scheduler,
                           host rotation reminder
 cogs/                     config, general, fun, qotd, ai
 utils/                    Event logging, snowflake IDs, log setup
-supabase/functions/chat/  The Groq proxy (deployed to Supabase, not the bot)
+supabase/functions/chat/                  The bot's Groq proxy
+supabase/functions/apply-guild-settings/  Dashboard settings write gate
+supabase/functions/sync-guilds/           Dashboard guild/permission sync
+supabase/functions/delete-account/        Dashboard account erasure
 ```
 
 ---
