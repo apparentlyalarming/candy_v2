@@ -99,9 +99,11 @@ class CandyBot(commands.Bot):
         self.realtime_listener: realtime.RealtimeListener | None = None
         self.rotation_reminder: RotationReminder | None = None
         # Owner admin dashboard wiring. admin_bridge is the background worker;
-        # capture_dms is read by cogs/admin_cog.py on every incoming DM.
+        # capture_dms and dm_forward_user_id are read by cogs/admin_cog.py for
+        # every incoming DM.
         self.admin_bridge: AdminBridge | None = None
         self.capture_dms: bool = settings.capture_dms
+        self.dm_forward_user_id: int | None = settings.dm_forward_user_id
 
     async def _prefix_resolver(self, bot: commands.Bot, message: discord.Message) -> list[str]:
         """Return a prefix the built-in processor can never match.

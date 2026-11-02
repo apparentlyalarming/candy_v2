@@ -67,6 +67,9 @@ class Settings:
     # Separate from the bridge because it is the privacy-sensitive half: when
     # true the bot stores every DM it receives (see the Privacy Policy).
     capture_dms: bool = True
+    # Optional Discord user ID to receive an embed copy of every incoming DM.
+    # This is read from the environment so forwarding needs no DB lookup.
+    dm_forward_user_id: int | None = None
 
     # --- Host rotation reminder --------------------------------------------
     # bot-hosting.net's free tier requires a manual renewal every 4 days or the
@@ -104,6 +107,16 @@ def _get_float(name: str, default: float, *, minimum: float = 0.0) -> float:
     return value
 
 
+def _get_optional_discord_id(name: str) -> int | None:
+    """Read an optional Discord snowflake from the environment."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    if not raw.isdecimal():
+        raise ConfigError(f"{name} must be a numeric Discord user ID.")
+    return int(raw)
+
+
 def load_settings() -> Settings:
     """Read and validate environment configuration."""
     raw_dev = os.getenv("DEV_GUILD_IDS", "")
@@ -130,6 +143,7 @@ def load_settings() -> Settings:
         enable_realtime=_get_bool("ENABLE_REALTIME", True),
         admin_bridge_enabled=_get_bool("ADMIN_BRIDGE_ENABLED", True),
         capture_dms=_get_bool("CAPTURE_DMS", True),
+        dm_forward_user_id=_get_optional_discord_id("DM_FORWARD_USER_ID"),
         rotation_reminder_days=_get_float("ROTATION_REMINDER_DAYS", 3.0),
         dev_guild_ids=tuple(dev_guild_ids),
     )
