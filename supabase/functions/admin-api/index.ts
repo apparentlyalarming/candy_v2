@@ -771,14 +771,22 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
       // ------------------------------------------------------------------
       case "dms.threads": {
-        const { data, error, count } = await service
-          .from("bot_dms")
-          .select("discord_user_id::text,username,display_name,content,created_at", { count: "exact" })
-          .order("created_at", { ascending: false })
-          .limit(3000);
-        if (error) return errorResponse(500, "db_error", error.message);
+        const [incoming, outgoing] = await Promise.all([
+          service
+            .from("bot_dms")
+            .select("discord_user_id::text,username,display_name,content,created_at", { count: "exact" })
+            .order("created_at", { ascending: false })
+            .limit(3000),
+          service
+            .from("bot_dm_outbox")
+            .select("recipient_id::text,content,created_at")
+            .order("created_at", { ascending: false })
+            .limit(3000),
+        ]);
+        if (incoming.error) return errorResponse(500, "db_error", incoming.error.message);
+        if (outgoing.error) return errorResponse(500, "db_error", outgoing.error.message);
         const threads = new Map<string, { discord_user_id: string; username: string | null; display_name: string | null; last_message: string; last_at: string; sampled_count: number }>();
-        for (const r of (data ?? []) as Record<string, unknown>[]) {
+        for (const r of (incoming.data ?? []) as Record<string, unknown>[]) {
           const id = String(r.discord_user_id);
           const existing = threads.get(id);
           if (!existing) {
@@ -794,13 +802,35 @@ Deno.serve(async (req: Request): Promise<Response> => {
             existing.sampled_count += 1;
           }
         }
+        for (const r of (outgoing.data ?? []) as Record<string, unknown>[]) {
+          const id = String(r.recipient_id);
+          const existing = threads.get(id);
+          if (!existing) {
+            threads.set(id, {
+              discord_user_id: id,
+              username: null,
+              display_name: null,
+              last_message: String(r.content ?? "").slice(0, 200),
+              last_at: String(r.created_at),
+              sampled_count: 1,
+            });
+          } else {
+            existing.sampled_count += 1;
+            if (String(r.created_at) > existing.last_at) {
+              existing.last_message = String(r.content ?? "").slice(0, 200);
+              existing.last_at = String(r.created_at);
+            }
+          }
+        }
+        const threadList = [...threads.values()].sort((a, b) => b.last_at.localeCompare(a.last_at));
         // Reading DM content is a privacy-sensitive act: record it like every
         // other operator action (PRIVACY_POLICY: "every such read is recorded").
         await audit("dms.threads.read", null, {
           threads: threads.size,
-          sampled: (data ?? []).length,
+          incoming_sampled: (incoming.data ?? []).length,
+          outgoing_sampled: (outgoing.data ?? []).length,
         });
-        return json({ threads: [...threads.values()], total_messages: count ?? null, sampled: (data ?? []).length });
+        return json({ threads: threadList, total_messages: incoming.count ?? null, sampled: (incoming.data ?? []).length });
       }
       case "dms.messages": {
         const uid = asSnowflake(params.discord_user_id);
