@@ -1539,6 +1539,10 @@ alter table public.admin_requests force row level security;
 --    and data_type in ('bigint','bigint[]')
 --  order by table_name, ordinal_position;
 
+-- Reload PostgREST schema cache so new tables/columns are visible immediately
+NOTIFY pgrst, 'reload schema';
+
+
 -- ============================================================================
 -- END OF SCHEMA
 -- ============================================================================

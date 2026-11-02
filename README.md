@@ -76,6 +76,10 @@ supabase functions deploy chat --use-api
 supabase functions deploy apply-guild-settings --use-api
 supabase functions deploy sync-guilds --use-api
 supabase functions deploy delete-account --use-api
+
+# Owner console (admin_web). Fails closed without ADMIN_EMAIL.
+supabase secrets set ADMIN_EMAIL=you@example.com
+supabase functions deploy admin-api --use-api
 ```
 
 `--use-api` bundles server-side and avoids Docker/Podman issues on

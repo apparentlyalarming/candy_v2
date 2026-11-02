@@ -16,17 +16,20 @@
 //
 // AUTHENTICATION vs AUTHORIZATION
 //   Authn: the JWT is verified against GoTrue (/auth/v1/user) on every request.
-//   Authz: the resulting user id must exist in public.dev_users. Both are
-//          re-checked per request; nothing is cached in the browser.
+//   Authz: the session must come from the email provider AND match the single
+//          ADMIN_EMAIL address, AND that user id must exist in dev_users. All
+//          are re-checked per request; nothing is cached in the browser.
 //
 // EVERY WRITE IS AUDITED
 //   Mutating actions append to admin_audit (who / what / target) before
 //   returning, so the dashboard has a truthful record of what the operator did.
 //
 // DEPLOY
+//   supabase secrets set ADMIN_EMAIL=you@example.com
 //   supabase functions deploy admin-api --use-api
-//   No extra secrets: SUPABASE_URL / SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY
-//   are provided to every function by the platform.
+//   ADMIN_EMAIL is required: without it every request fails closed. The other
+//   values (SUPABASE_URL / SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY) are
+//   provided to every function by the platform.
 // ============================================================================
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -235,6 +238,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
   // --- 1. Authenticate -----------------------------------------------------
   let userId: string | null = null;
   let email: string | null = null;
+  let provider: string | null = null;
   try {
     const res = await fetch(`${base}/auth/v1/user`, {
       method: "GET",
@@ -245,6 +249,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
       if (typeof user?.id === "string" && user.id) {
         userId = user.id;
         email = typeof user?.email === "string" ? user.email : null;
+        provider =
+          typeof user?.app_metadata?.provider === "string" ? user.app_metadata.provider : null;
       }
     }
   } catch {
@@ -252,11 +258,24 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
   if (!userId) return errorResponse(401, "invalid_auth", "Invalid or expired token.");
 
+  // --- 2. Authorize the operator identity ----------------------------------
+  // Email + password only. The session must come from the email provider and
+  // match the single configured address. OAuth (Google/Discord) sessions are
+  // refused even when they carry the same address, so the console cannot be
+  // entered by clicking a provider button.
+  const adminEmail = (Deno.env.get("ADMIN_EMAIL") ?? "").trim().toLowerCase();
+  if (!adminEmail) {
+    return errorResponse(500, "server_misconfigured", "ADMIN_EMAIL is not set.");
+  }
+  if (provider !== "email" || (email ?? "").trim().toLowerCase() !== adminEmail) {
+    return errorResponse(403, "not_admin", "This account is not the operator account.");
+  }
+
   const service = createClient(base, serviceKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
 
-  // --- 2. Authorize against the owner allowlist ----------------------------
+  // --- 3. Authorize against the owner allowlist ----------------------------
   const { data: devRow, error: devErr } = await service
     .from("dev_users")
     .select("user_id,note")
@@ -284,7 +303,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     }
   };
 
-  // --- 3. Parse the request ------------------------------------------------
+  // --- 4. Parse the request ------------------------------------------------
   let action = "";
   let params: Record<string, unknown> = {};
   try {
