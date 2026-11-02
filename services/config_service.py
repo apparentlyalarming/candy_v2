@@ -331,6 +331,11 @@ class ConfigService:
         This is the ANALYTICS record (counts/tokens/latency and a one-line gist).
         The restart-safe conversation store is :meth:`record_memory_turn`.
         """
+        import os
+
+        if os.getenv("DISABLE_AI_INTERACTIONS", "").lower() in ("1", "true", "yes"):
+            return
+
         gid = to_id(guild_id)
         if gid is None:
             return
@@ -531,6 +536,13 @@ class ConfigService:
         # Query returned newest-first; the prompt wants chronological order.
         return list(reversed(rows))
 
+    def __init__(self) -> None:
+        from collections import defaultdict
+        import time
+
+        self._last_prune: dict[int, float] = defaultdict(float)
+        self._prune_interval_seconds = 21600  # 6 hours
+
     def prune_ai_memory(self, guild_id: int, keep_days: int) -> int:
         """Delete this guild's turns older than ``keep_days``. Returns count.
 
@@ -538,17 +550,27 @@ class ConfigService:
         ai_trim_channel helper, so retention needs no scheduled job. A no-op when
         ``keep_days`` <= 0 (keep forever).
         """
+        import time
+
         gid = to_id(guild_id)
         if gid is None or keep_days <= 0:
             return 0
+
+        # Throttle pruning to reduce disk I/O - prune at most once every 6 hours per guild
+        now = time.monotonic()
+        if gid in self._last_prune and (now - self._last_prune[gid]) < self._prune_interval_seconds:
+            return 0
+
         try:
-            return int(
+            result = int(
                 supabase_client.call_rpc(
                     "ai_memory_prune",
                     {"p_guild_id": gid, "p_keep_days": max(1, int(keep_days))},
                 )
                 or 0
             )
+            self._last_prune[gid] = now
+            return result
         except Exception as exc:  # noqa: BLE001
             log.debug("ai_memory_prune failed: %s", exc)
             return 0

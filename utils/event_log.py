@@ -138,6 +138,12 @@ class EventLogger:
         channel_id: int | None,
         metadata: dict[str, Any] | None,
     ) -> None:
+        import os
+
+        # Option to disable DB writes for events to reduce I/O
+        if os.getenv("DISABLE_BOT_EVENTS_DB", "").lower() in ("1", "true", "yes"):
+            return
+
         payload = {
             "guild_id": guild_id,
             "category": category,
