@@ -177,6 +177,7 @@ class GeneralCog(commands.Cog, name="General"):
                     "`/config replies` - customise fun action replies\n"
                     "`/config qotd` - Question of the Day\n"
                     "`/report` - monthly server report: generate, edit, publish\n"
+                    "`/report test` - check the report setup and post a test message\n"
                     "`/config report` - report schedule, channel and data sources\n"
                     f"`{prefix}memory on|off` - toggle the AI's memory"
                 ),

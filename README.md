@@ -136,6 +136,7 @@ an owner without Manage Server would not see it under `/config`.
 | `/report publish` | Post a report to the configured channel, or one you pass. |
 | `/report edit` | Write or replace one human-written section. |
 | `/report list` | Recent reports and their draft/published status. |
+| `/report test` | Verify the setup and post a test message to the report channel. |
 
 Fun replies are chosen at random from a per-action list. Guilds can override the
 defaults, and a guild override takes precedence over the catalog default.
@@ -357,6 +358,15 @@ be parsed are still stored with their raw embed and flagged `needs_review`.
 /config report timezone Asia/Kolkata # or UTC+5:30
 /config report toggle true
 ```
+
+Run `/report test` after configuring the channel. It walks the exact path a
+scheduled report takes and stops at the first problem with a fixable message:
+no channel set, the channel was deleted, missing permissions (it lists every
+one), the database RPC is unreachable (was `schema.sql` applied?), or Discord
+refused the message. On success it posts a short test message — with this
+month's live counts — to the report channel and links to it, plus soft
+warnings for things that will not block delivery (schedule still off, tracking
+disabled, nothing collected yet).
 
 `/config report status` shows the schedule, data sources and last generated
 period. `/config report modlog` points at the channel where Dyno posts its logs;

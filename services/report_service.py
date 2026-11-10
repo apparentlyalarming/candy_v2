@@ -395,6 +395,29 @@ class ReportService:
         }
         return await asyncio.to_thread(self._upsert_row, payload)
 
+    async def delivery_probe(self, guild: discord.Guild) -> dict[str, Any]:
+        """Health check for ``/report test``: read the current month so far.
+
+        ``report_summary`` touches every report table, so a missing schema, a
+        revoked grant, or a broken RPC fails HERE with a clear message instead
+        of silently at the scheduled minute. The summary it returns is live
+        data for the current month-to-date, so the test message can also say
+        how much has been collected so far.
+        """
+        config = self._config.get(guild.id)
+        zone = resolve_zone(config.report_timezone)
+        now = datetime.now(timezone.utc)
+        local_today = now.astimezone(zone).date()
+        period = ReportPeriod(
+            start=local_today.replace(day=1),
+            end=local_today,
+            start_at=datetime.combine(local_today.replace(day=1), dtime(0, 0))
+            .replace(tzinfo=zone)
+            .astimezone(timezone.utc),
+            end_at=now,
+        )
+        return await asyncio.to_thread(self._fetch_summary, guild.id, period)
+
     # -- database helpers (blocking) ---------------------------------------
 
     @staticmethod

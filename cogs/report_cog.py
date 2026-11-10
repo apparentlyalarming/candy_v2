@@ -21,6 +21,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from cogs import bind_group_commands
+from config import settings
 from db.config_cache import GuildConfig
 from services.config_service import ConfigError, ConfigService, TimezoneError
 from services.report_scheduler import ReportScheduler, parse_report_time
@@ -345,6 +346,149 @@ class ReportCog(commands.Cog, name="Report"):
             status = row.get("status") or "draft"
             marker = "✅" if status == "published" else "📝"
             lines.append(f"{marker} **{period}** — {status}")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    @report_group.command(
+        name="test",
+        description="Check the report setup and post a test message to the report channel.",
+    )
+    async def test(self, interaction: discord.Interaction) -> None:
+        """Run the exact path a scheduled report takes, step by step.
+
+        Every failure below is one the scheduler would otherwise hit silently
+        at the scheduled minute, so each stops the test with an actionable
+        message rather than a generic error.
+        """
+        guild = await self._guild(interaction)
+        if guild is None:
+            return
+
+        config = self.config.get(guild.id)
+
+        # -- 1. a channel is configured ---------------------------------
+        channel_id = config.report_channel_id
+        if channel_id is None:
+            await interaction.response.send_message(
+                "❌ No report channel is configured.\n"
+                "Set one with `/config report channel #channel` first.",
+                ephemeral=True,
+            )
+            return
+
+        # -- 2. the channel still exists and can be posted in -------------
+        channel = guild.get_channel(channel_id)
+        if not isinstance(channel, discord.abc.Messageable):
+            await interaction.response.send_message(
+                f"❌ The configured report channel (id `{channel_id}`) was "
+                "deleted, or is not a channel I can post in.\n"
+                "Set a new one with `/config report channel #channel`.",
+                ephemeral=True,
+            )
+            return
+
+        # -- 3. the bot holds the permissions a report needs --------------
+        me = guild.me
+        if me is None:
+            try:
+                me = await guild.fetch_member(self.bot.user.id)
+            except discord.HTTPException:
+                me = None
+        if me is not None:
+            perms = channel.permissions_for(me)
+            missing = [
+                label
+                for label, present in (
+                    ("View Channels", perms.view_channel),
+                    ("Send Messages", perms.send_messages),
+                    ("Attach Files", perms.attach_files),
+                )
+                if not present
+            ]
+            if missing:
+                await interaction.response.send_message(
+                    "❌ I'm missing "
+                    + ", ".join(f"**{m}**" for m in missing)
+                    + f" in {channel.mention}.\n"
+                    "An admin has to grant them, either in my server role or "
+                    "in that channel's own permission overrides.",
+                    ephemeral=True,
+                )
+                return
+
+        # -- 4. the database answers (RPC, tables, grants) ----------------
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            summary = await self.service.delivery_probe(guild)
+        except ReportError as exc:
+            await interaction.followup.send(
+                f"❌ Database check failed: {exc}\n"
+                "Most likely cause: `supabase/schema.sql` (section 07c and "
+                "the `report_summary` RPC) was not applied to the project.",
+                ephemeral=True,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.error("Report test database check failed: %s", exc, exc_info=True)
+            await interaction.followup.send(
+                "❌ Unexpected database error. Check the bot logs.", ephemeral=True
+            )
+            return
+
+        # -- 5. a message actually lands in the channel ------------------
+        days = _num(summary.get("days_tracked"))
+        try:
+            message = await channel.send(
+                content=(
+                    "🧪 **Report delivery test** — this channel will receive "
+                    "the monthly server report.\n"
+                    f"So far this month: **{_num(summary.get('total_messages'))}** "
+                    f"messages across **{days}** tracked day(s)."
+                ),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.Forbidden:
+            # Possible even after the check above: permission overrides can
+            # differ between what the cache says and what Discord enforces.
+            await interaction.followup.send(
+                f"❌ Discord refused the test message in {channel.mention}: "
+                "I lack Send Messages there. Check the channel's permission "
+                "overrides.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as exc:
+            await interaction.followup.send(
+                f"❌ Discord rejected the test message: {exc}", ephemeral=True
+            )
+            return
+
+        # -- 6. success, plus anything worth knowing ----------------------
+        url = f"https://discord.com/channels/{guild.id}/{channel.id}/{message.id}"
+        try:
+            days_count = int(summary.get("days_tracked") or 0)
+        except (TypeError, ValueError):
+            days_count = 0
+        notes: list[str] = []
+        if not config.report_enabled:
+            notes.append(
+                "The automatic schedule is **off** — arm it with "
+                "`/config report toggle true`."
+            )
+        if not settings.activity_tracking_enabled:
+            notes.append(
+                "Activity tracking is disabled bot-wide "
+                "(`ACTIVITY_TRACKING_ENABLED`), so nothing new is counted."
+            )
+        if days_count <= 0:
+            notes.append(
+                "No activity recorded for this month yet — the first report "
+                "may look empty. That is normal right after setup."
+            )
+
+        lines = [f"✅ Test passed — message posted in {channel.mention}: <{url}>"]
+        if notes:
+            lines.append("")
+            lines.extend(f"⚠️ {n}" for n in notes)
         await interaction.followup.send("\n".join(lines), ephemeral=True)
 
     # ------------------------------------------------------------------
