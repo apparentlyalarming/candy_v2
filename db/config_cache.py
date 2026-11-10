@@ -53,6 +53,16 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "qotd_days": [],
     "qotd_empty_queue_notice": False,
     "qotd_last_fired_at": None,
+    # monthly report + activity tracking
+    "report_enabled": False,
+    "report_channel_id": None,
+    "report_day": 1,
+    "report_time": "09:00:00",
+    "report_timezone": "UTC",
+    "report_last_generated_period": None,
+    "moderation_log_channel_id": None,
+    "dyno_user_id": 155149108183695360,
+    "staff_role_ids": [],
 }
 
 
@@ -221,6 +231,56 @@ class GuildConfig:
     def qotd_last_fired_at(self) -> str | None:
         value = self.raw.get("qotd_last_fired_at")
         return None if value is None else str(value)
+
+    # monthly report + activity tracking
+    @property
+    def report_enabled(self) -> bool:
+        return bool(self.get("report_enabled"))
+
+    @property
+    def report_channel_id(self) -> int | None:
+        return to_id(self.raw.get("report_channel_id"))
+
+    @property
+    def report_day(self) -> int:
+        """Day of month the automatic report runs (1-28)."""
+        try:
+            day = int(self.get("report_day"))
+        except (TypeError, ValueError):
+            return 1
+        return min(28, max(1, day))
+
+    @property
+    def report_time(self) -> str | None:
+        value = self.get("report_time")
+        return None if value is None else str(value)
+
+    @property
+    def report_timezone(self) -> str:
+        return str(self.get("report_timezone") or "UTC")
+
+    @property
+    def report_last_generated_period(self) -> str | None:
+        value = self.raw.get("report_last_generated_period")
+        return None if value is None else str(value)
+
+    @property
+    def moderation_log_channel_id(self) -> int | None:
+        return to_id(self.raw.get("moderation_log_channel_id"))
+
+    @property
+    def dyno_user_id(self) -> int:
+        return to_id(self.get("dyno_user_id")) or 155149108183695360
+
+    @property
+    def staff_role_ids(self) -> list[int]:
+        raw = self.get("staff_role_ids") or []
+        result: list[int] = []
+        for item in raw:
+            parsed = to_id(item)
+            if parsed is not None:
+                result.append(parsed)
+        return result
 
     def as_dict(self) -> dict[str, Any]:
         """Merged view: DB row on top of defaults."""

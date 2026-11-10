@@ -52,6 +52,8 @@ COGS = [
     "cogs.qotd_cog",
     "cogs.ai_cog",
     "cogs.admin_cog",
+    "cogs.activity_cog",
+    "cogs.report_cog",
 ]
 
 
@@ -381,6 +383,18 @@ class CandyBot(commands.Bot):
         if self.rotation_reminder is not None:
             with contextlib.suppress(Exception):
                 await self.rotation_reminder.stop()
+
+        # Cogs own background loops; cog_unload is not called by close(), so
+        # stop them explicitly. Activity first: its final flush should land
+        # before the database client is torn down.
+        activity_cog = self.get_cog("Activity")
+        if activity_cog is not None:
+            with contextlib.suppress(Exception):
+                await activity_cog.shutdown()  # type: ignore[attr-defined]
+        report_cog = self.get_cog("Report")
+        if report_cog is not None:
+            with contextlib.suppress(Exception):
+                await report_cog.shutdown()  # type: ignore[attr-defined]
 
         if self.groq_service is not None:
             with contextlib.suppress(Exception):

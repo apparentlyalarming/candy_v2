@@ -78,6 +78,20 @@ class Settings:
     # observe). Set to 0 to disable the reminder entirely.
     rotation_reminder_days: float = 3.0
 
+    # --- Activity tracking + monthly reports -------------------------------
+    # Counters live in memory and are flushed in one RPC per guild. Turning
+    # this off stops the collection entirely (the report then has no numbers,
+    # but existing rows are untouched).
+    activity_tracking_enabled: bool = True
+    activity_flush_seconds: int = 300
+    # Per-member/channel/hour rows older than this are pruned. Daily totals,
+    # reports, boosts and moderation events are kept.
+    report_retention_days: int = 400
+    # Audit-log poll cadence and how far back the first poll reaches. Discord
+    # audit entries expire after 45 days, so the backfill is capped below that.
+    moderation_poll_seconds: int = 600
+    moderation_backfill_days: int = 30
+
     @property
     def has_groq(self) -> bool:
         return bool(self.groq_api_key)
@@ -102,6 +116,35 @@ def _get_float(name: str, default: float, *, minimum: float = 0.0) -> float:
     if value < minimum:
         logging.getLogger(__name__).warning(
             "%s must be >= %s (got %s); using default %s", name, minimum, value, default
+        )
+        return default
+    return value
+
+
+def _get_int(name: str, default: int, *, minimum: int = 0, maximum: int | None = None) -> int:
+    """Read an optional integer, falling back to ``default`` on bad input.
+
+    A typo in an operational knob must not stop the bot from booting; the
+    value is clamped into range and a warning is logged instead.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "%s is not an integer (%r); using default %s", name, raw, default
+        )
+        return default
+    if value < minimum:
+        logging.getLogger(__name__).warning(
+            "%s must be >= %s (got %s); using default %s", name, minimum, value, default
+        )
+        return default
+    if maximum is not None and value > maximum:
+        logging.getLogger(__name__).warning(
+            "%s must be <= %s (got %s); using default %s", name, maximum, value, default
         )
         return default
     return value
@@ -145,6 +188,19 @@ def load_settings() -> Settings:
         capture_dms=_get_bool("CAPTURE_DMS", True),
         dm_forward_user_id=_get_optional_discord_id("DM_FORWARD_USER_ID"),
         rotation_reminder_days=_get_float("ROTATION_REMINDER_DAYS", 3.0),
+        activity_tracking_enabled=_get_bool("ACTIVITY_TRACKING_ENABLED", True),
+        activity_flush_seconds=_get_int(
+            "ACTIVITY_FLUSH_SECONDS", 300, minimum=60, maximum=3600
+        ),
+        report_retention_days=_get_int(
+            "REPORT_RETENTION_DAYS", 400, minimum=30, maximum=3650
+        ),
+        moderation_poll_seconds=_get_int(
+            "MODERATION_POLL_SECONDS", 600, minimum=120, maximum=3600
+        ),
+        moderation_backfill_days=_get_int(
+            "MODERATION_BACKFILL_DAYS", 30, minimum=0, maximum=45
+        ),
         dev_guild_ids=tuple(dev_guild_ids),
     )
 

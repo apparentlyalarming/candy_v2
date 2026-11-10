@@ -17,13 +17,21 @@
 //     - user_preferences (on delete cascade)  -> the saved theme
 //     - dev_users        (on delete cascade)  -> the dev allowlist row
 //
-//   Two tables do NOT key on auth.users, so no cascade reaches them. This
+//   Tables that do NOT key on auth.users, so no cascade reaches them. This
 //   function removes their rows by hand, using the Discord snowflake it reads
 //   from profiles first (after the auth user is gone, that mapping is gone too):
-//     - bot_dms         the user's direct messages to the Bot
-//     - bot_dm_outbox   replies the operator had queued to send to them
-//   Direct messages are deleted rather than blanked, because a DM thread is
-//   about one person and loses its meaning without them.
+//     - bot_dms              the user's direct messages to the Bot
+//     - bot_dm_outbox        replies the operator had queued to send to them
+//     - guild_member_activity the user's per-member report rows. These are
+//                            DELETED, not anonymised: the primary key is
+//                            (guild_id, day, user_id), so clearing the id is
+//                            impossible. Only this person's ranking rows go;
+//                            the server's daily totals live in
+//                            guild_daily_stats, which is not per-user, so past
+//                            monthly reports keep their totals.
+//     - guild_boost_events   the user's boost start/stop events. Same rule:
+//                            the row is about one person and the report's boost
+//                            counts come from the daily totals.
 //
 // WHAT SURVIVES, WITHOUT YOU
 //   Two tables keep their rows for the server's continuity:
@@ -32,6 +40,13 @@
 //                   identifiers are cleared.
 //     - bot_events  the server's audit trail, so the EVENT stays and the actor
 //                   is cleared.
+//     - guild_moderation_events  same as bot_events: the record stays (kind,
+//                   reason, time) and the identifiers are cleared, whether the
+//                   user was the target or the moderator. raw_embed is cleared
+//                   too, because a Dyno embed can quote both names.
+//     - guild_reports  generated reports are point-in-time documents, like a
+//                   quoted message: they are not rewritten on deletion. The
+//                   rows that feed FUTURE reports are the ones above.
 //   A Discord snowflake is a name tag, not an anonymous number: leaving it on a
 //   row would make the word "anonymised" false, so this function clears
 //   discord_user_id / user_display_name and actor_id / actor_name explicitly
@@ -147,7 +162,16 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
   const discordUserId: string | null = profile?.discord_user_id_text ?? null;
   if (discordUserId !== null) {
-    const [memory, events, dms, outbox] = await Promise.all([
+    const [
+      memory,
+      events,
+      dms,
+      outbox,
+      memberActivity,
+      boosts,
+      modTargets,
+      modModerators,
+    ] = await Promise.all([
       admin
         .from("ai_memory")
         .update({ discord_user_id: null, user_display_name: null })
@@ -164,8 +188,36 @@ Deno.serve(async (req: Request): Promise<Response> => {
         .from("bot_dm_outbox")
         .delete()
         .eq("recipient_id", discordUserId),
+      // Monthly-report tables (keyed by Discord snowflake, no auth cascade):
+      // the user's own rows go, the server's aggregate totals do not.
+      admin
+        .from("guild_member_activity")
+        .delete()
+        .eq("user_id", discordUserId),
+      admin
+        .from("guild_boost_events")
+        .delete()
+        .eq("user_id", discordUserId),
+      // Moderation records stay for the server's history, the link goes - the
+      // same rule as bot_events. raw_embed quotes both names, so it goes too.
+      admin
+        .from("guild_moderation_events")
+        .update({ target_id: null, target_name: null, raw_embed: null })
+        .eq("target_id", discordUserId),
+      admin
+        .from("guild_moderation_events")
+        .update({ moderator_id: null, moderator_name: null, raw_embed: null })
+        .eq("moderator_id", discordUserId),
     ]);
-    const failure = memory.error ?? events.error ?? dms.error ?? outbox.error;
+    const failure =
+      memory.error ??
+      events.error ??
+      dms.error ??
+      outbox.error ??
+      memberActivity.error ??
+      boosts.error ??
+      modTargets.error ??
+      modModerators.error;
     if (failure) {
       // Refuse rather than half-fulfil: the response below promises the link is
       // gone, and a retry is cheap.

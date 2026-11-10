@@ -50,7 +50,14 @@ def select(
         else:
             query = query.eq(column, value)
     if order_by:
-        query = query.order(order_by)
+        column = order_by
+        descending = False
+        if column.endswith(".desc"):
+            column = column[:-5]
+            descending = True
+        elif column.endswith(".asc"):
+            column = column[:-4]
+        query = query.order(column, desc=descending)
     if limit is not None:
         query = query.limit(limit)
 

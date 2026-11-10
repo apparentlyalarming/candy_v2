@@ -42,7 +42,10 @@ const CORS_HEADERS: Record<string, string> = {
 
 // Columns the owner may write on guild_settings. Same allowlist as
 // apply-guild-settings: it exists so a caller cannot rewrite guild_id/created_at
-// or updated_at (which the optimistic lock depends on).
+// or updated_at (which the optimistic lock depends on). The monthly-report
+// columns (report_*, moderation_log_channel_id, dyno_user_id, staff_role_ids)
+// are deliberately NOT here: they are managed from Discord via /config report,
+// and the console edit path for them is deferred with the dashboard work.
 const EDITABLE_SETTINGS = new Set<string>([
   "prefix",
   "prefix_enabled",
@@ -72,7 +75,9 @@ const EDITABLE_SETTINGS = new Set<string>([
 
 // Tables the read-only explorer may touch, with a sensible default ordering.
 // An allowlist, not "whatever PostgREST exposes": it keeps the explorer from
-// wandering into a future table nobody meant to publish.
+// wandering into a future table nobody meant to publish. The monthly-report
+// tables below are here because the owner asked to see every table; they are
+// read-only here, same as the rest.
 const TABLES: Record<string, { order?: string; asc?: boolean }> = {
   guilds: { order: "created_at", asc: false },
   guild_settings: { order: "created_at", asc: false },
@@ -90,21 +95,39 @@ const TABLES: Record<string, { order?: string; asc?: boolean }> = {
   bot_dm_outbox: { order: "created_at", asc: false },
   admin_audit: { order: "created_at", asc: false },
   admin_requests: { order: "created_at", asc: false },
+  // --- monthly report / activity tracking (added with the report feature) ---
+  guild_daily_stats: { order: "day", asc: false },
+  guild_channel_activity: { order: "day", asc: false },
+  guild_hourly_activity: { order: "day", asc: false },
+  guild_member_activity: { order: "day", asc: false },
+  guild_boost_events: { order: "occurred_at", asc: false },
+  guild_moderation_events: { order: "occurred_at", asc: false },
+  guild_moderation_cursors: {},
+  guild_events: { order: "start_time", asc: false },
+  guild_reports: { order: "period_start", asc: false },
 };
 
 const GUILD_SELECT =
   "id::text,name,icon_url,bot_present,member_count,online_count,stats_updated_at,created_at," +
   "guild_settings(ai_enabled,qotd_enabled,prefix,updated_at)";
 
-// `*` plus the two bigint[] columns read a second time as text. PostgREST
+// `*` plus every snowflake column read a second time as text. PostgREST
 // serialises bigint as a JSON number, and a Discord snowflake is past 2^53, so
-// an id inside these arrays arrives rounded (…333 becomes …400). The form would
+// an id arriving as a number is rounded (…333 becomes …400). The form would
 // then display the wrong channel and saving it would write the rounded value
-// back, silently retargeting the AI. Postgres renders int8[] as "{123,456}",
-// which parseBigintArrayText turns back into exact strings.
+// back, silently retargeting the AI, the log channel or the report channel.
+// Postgres renders int8[] as "{123,456}", which parseBigintArrayText turns
+// back into exact strings. The scalar casts must cover every bigint column in
+// guild_settings - see BIGINT_COLUMNS below and schema.sql 08.13.
 const SETTINGS_SELECT =
-  "*,ai_channel_ids_text:ai_channel_ids::text," +
-  "ai_memory_ignored_channels_text:ai_memory_ignored_channels::text";
+  "*,guild_id_text:guild_id::text,log_channel_id_text:log_channel_id::text," +
+  "qotd_channel_id_text:qotd_channel_id::text,qotd_role_id_text:qotd_role_id::text," +
+  "report_channel_id_text:report_channel_id::text," +
+  "moderation_log_channel_id_text:moderation_log_channel_id::text," +
+  "dyno_user_id_text:dyno_user_id::text," +
+  "ai_channel_ids_text:ai_channel_ids::text," +
+  "ai_memory_ignored_channels_text:ai_memory_ignored_channels::text," +
+  "staff_role_ids_text:staff_role_ids::text";
 
 function parseBigintArrayText(value: unknown): string[] | null {
   if (value === null || value === undefined) return null;
@@ -120,8 +143,14 @@ function parseBigintArrayText(value: unknown): string[] | null {
 /** Make a guild_settings row safe to send to a browser with 64-bit ids intact. */
 function settingsForClient(data: Record<string, unknown>): Record<string, unknown> {
   const out = { ...data };
-  if (typeof out.guild_id === "number" || typeof out.guild_id === "string") {
-    out.guild_id = String(out.guild_id);
+  // Scalars arrive twice: once as a rounded JSON number (the `*`) and once as
+  // an exact *_text alias. Keep the alias, drop the rounded copy.
+  for (const column of BIGINT_COLUMNS.guild_settings) {
+    const alias = `${column}_text`;
+    if (alias in out) {
+      out[column] = out[alias] === null || out[alias] === undefined ? null : String(out[alias]);
+      delete out[alias];
+    }
   }
   for (const column of BIGINT_ARRAY_COLUMNS.guild_settings) {
     const alias = `${column}_text`;
@@ -138,10 +167,22 @@ function settingsForClient(data: Record<string, unknown>): Record<string, unknow
 // Discord snowflake past 2^53 would arrive rounded - the explorer would show
 // ids that do not exist. It therefore asks for each of these a second time as
 // text and swaps it into the row before answering. schema.sql verification 08.13
-// lists every bigint column in public; this map must cover all of them.
+// lists every bigint column in public; this map must cover all of them. That
+// includes the duration columns (voice_seconds, bot_online_seconds): they can
+// never reach 2^53, but casting them too keeps the map literally identical to
+// the 08.13 output, and the explorer stringifies every value for display
+// anyway.
 const BIGINT_COLUMNS: Record<string, string[]> = {
   guilds: ["id"],
-  guild_settings: ["guild_id", "log_channel_id", "qotd_channel_id", "qotd_role_id"],
+  guild_settings: [
+    "guild_id",
+    "log_channel_id",
+    "qotd_channel_id",
+    "qotd_role_id",
+    "report_channel_id",
+    "moderation_log_channel_id",
+    "dyno_user_id",
+  ],
   user_guilds: ["guild_id", "permissions"],
   profiles: ["discord_user_id"],
   guild_replies: ["guild_id"],
@@ -153,10 +194,20 @@ const BIGINT_COLUMNS: Record<string, string[]> = {
   bot_dm_outbox: ["id", "recipient_id"],
   admin_audit: ["id"],
   admin_requests: ["id"],
+  // --- monthly report / activity tracking ---
+  guild_daily_stats: ["guild_id", "voice_seconds", "bot_online_seconds"],
+  guild_channel_activity: ["guild_id", "channel_id", "voice_seconds"],
+  guild_hourly_activity: ["guild_id", "voice_seconds"],
+  guild_member_activity: ["guild_id", "user_id", "voice_seconds"],
+  guild_boost_events: ["id", "guild_id", "user_id"],
+  guild_moderation_events: ["id", "guild_id", "target_id", "moderator_id"],
+  guild_moderation_cursors: ["guild_id", "last_audit_id"],
+  guild_events: ["guild_id", "event_id", "channel_id"],
+  guild_reports: ["guild_id", "published_channel_id", "published_message_id"],
 };
 
 const BIGINT_ARRAY_COLUMNS: Record<string, string[]> = {
-  guild_settings: ["ai_channel_ids", "ai_memory_ignored_channels"],
+  guild_settings: ["ai_channel_ids", "ai_memory_ignored_channels", "staff_role_ids"],
 };
 
 function explorerSelect(table: string): string {

@@ -1,7 +1,8 @@
 # candy_v2
 
 A Discord bot with per-server config (stored in Supabase), Groq-powered AI chat,
-randomised fun action replies, and a Question of the Day queue.
+randomised fun action replies, a Question of the Day queue, and an opt-in
+monthly server report built from activity and moderation statistics.
 
 The companion dashboard is a separate repo: `candy_web`. It reads and writes the
 same Supabase project, so there is one schema and one source of truth.
@@ -109,6 +110,7 @@ Everything is editable from **both** Discord and the dashboard. In Discord:
 | `/config chat` | AI toggle, model, system prompt, channels, context, memory, memory window, ignored channels, cooldown, temperature, max tokens |
 | `/config replies` | List, add, remove, toggle, reset fun action replies |
 | `/config qotd` | Toggle, time, timezone, channel, role, days, add, list, remove, next, skip |
+| `/config report` | Toggle, channel, schedule, timezone, modlog, dyno, staffroles |
 | `/config dev renewed` | Bot owner only. Resets the host-renewal reminder clock. |
 All `/config` subcommands require **Manage Server**, except `/config dev renewed`
 which requires being the **bot owner** — the host renewal is an account-level
@@ -129,6 +131,11 @@ an owner without Manage Server would not see it under `/config`.
 | `!help` | The same role-aware menu as `/help`, as a text command. |
 | `/hello`, `/help` | General. |
 | `/hug`, `/punch`, `/kick`, ... | Fun actions. Every one also works as `!hug`, etc. |
+| `/report generate` | Build a draft report for a month (previous month by default). |
+| `/report view` | Preview the stored report; posts a `.md` file when it is long. |
+| `/report publish` | Post a report to the configured channel, or one you pass. |
+| `/report edit` | Write or replace one human-written section. |
+| `/report list` | Recent reports and their draft/published status. |
 
 Fun replies are chosen at random from a per-action list. Guilds can override the
 defaults, and a guild override takes precedence over the catalog default.
@@ -294,6 +301,118 @@ restores the configured depth rather than resetting it to zero.
 
 ---
 
+## Monthly server report
+
+An **opt-in** report for the previous calendar month, in the server's own
+timezone. It is a plain markdown document with seven fixed sections:
+
+1. Server Overview
+2. Server Activity
+3. Community Highlights
+4. Staff & Moderation
+5. Events & Activities
+6. Issues & Improvements
+7. Final Summary
+
+Sections 1, 2, 4 and 5 are filled from collected statistics. Sections 3, 6 and
+the prose in 7 are **human-written** and are stored on the report row, so they
+survive regeneration. Nothing is posted automatically until an admin turns it on
+**and** sets a channel.
+
+### What is collected
+
+| Data | How |
+|---|---|
+| Member count at month start/end | daily snapshot written by the activity flush |
+| Messages | counted per day, hour, channel and member (bots excluded) |
+| Voice time | connected seconds per member and channel, including AFK |
+| Joins, leaves, boosts | gateway events plus `premium_since` transitions |
+| Warnings | parsed from **Dyno** mod-log embeds only |
+| Bans, kicks, unbans, timeouts | Discord **audit log** |
+| Events | mirrored Discord scheduled events and participation counts |
+
+Counters live **in memory** and are flushed in one RPC per guild (default every
+5 minutes). A crash loses at most the current flush window; the bot does not
+write to the database on every message.
+
+Message and voice rankings are deliberately **separate** — there is no combined
+"most active" score. Voice counts all connected time, including the AFK channel.
+
+### Moderation sources, and the honest caveat
+
+Warnings are only read from Dyno's mod-log embeds, because Discord's audit log
+has no "warn" action. Everything else comes from the audit log. Dyno's
+ban/kick embeds are ignored so the same action is not counted twice.
+
+When an action is issued **through Dyno**, Discord records Dyno as the audit-log
+actor. The report stores `via` (`native` or `dyno`) and reports that honestly
+rather than guessing which human pressed the button. Warning embeds that cannot
+be parsed are still stored with their raw embed and flagged `needs_review`.
+
+### Setup
+
+```
+/config report channel #staff
+/config report schedule 1 09:00      # day 1-28, local time
+/config report timezone Asia/Kolkata # or UTC+5:30
+/config report toggle true
+```
+
+`/config report status` shows the schedule, data sources and last generated
+period. `/config report modlog` points at the channel where Dyno posts its logs;
+`/config report dyno` changes which bot is treated as Dyno (default is Dyno's
+public bot, `155149108183695360`). `/config report staffroles` marks which roles
+count as staff.
+
+Generate on demand with `/report generate`, fill in the narrative sections with
+`/report edit`, preview with `/report view`, then `/report publish`. Reports are
+stored in `guild_reports` as `auto_data` (numbers) plus `narrative` (prose) plus
+the rendered markdown.
+
+The scheduler generates only the **most recent** missed period. If the bot was
+offline for several months, older periods are logged as skipped instead of
+flooding the channel with a backlog. A failed delivery is retried after 30
+minutes. Day 1–28 avoids the months that have no 29th–31st.
+
+### Required permissions and intents
+
+The bot needs, in addition to its existing permissions:
+
+- **View Channels** and **Read Message History** (activity counts)
+- **View Audit Log** (ban/kick/unban/timeout)
+- **Send Messages**, **Embed Links**, **Attach Files** (report delivery)
+
+The **Message Content** and **Server Members** intents are already required by
+other features. The **Presence** intent is optional: without it online counts
+are stored as `NULL` and the report omits them rather than showing a false zero.
+
+### Retention and privacy
+
+Per-member, per-channel and per-hour detail is pruned after about 400 days
+(`REPORT_RETENTION_DAYS`). Daily totals, generated reports, boost events and
+moderation events are kept. **No message text, attachment content or voice audio
+is stored** — only counts, timestamps, channel names and display-name snapshots.
+Deleting a dashboard account removes that user's per-member rows and boost
+events, and clears their identifiers from moderation records; generated
+reports are point-in-time documents and are not rewritten. This is disclosed
+in the Privacy Policy (section 3.10).
+
+Environment variables (all optional):
+
+```
+ACTIVITY_TRACKING_ENABLED=true   # false stops collection entirely
+ACTIVITY_FLUSH_SECONDS=300       # 60-3600
+REPORT_RETENTION_DAYS=400        # 30-3650
+MODERATION_POLL_SECONDS=600      # 120-3600, needs View Audit Log
+MODERATION_BACKFILL_DAYS=30      # first poll only, capped at 45 by Discord
+```
+
+Two disclosures the report makes explicit: "Members Left" includes kicks and
+bans (the existing join/leave counter treats every removal as a leave), and the
+first tracked month may have data gaps if tracking started mid-month.
+
+---
+
 ## Project layout
 
 ```
@@ -301,14 +420,15 @@ main.py                   Entry point and startup order
 config.py                 Environment configuration
 supabase/schema.sql       ALL structure: tables, columns, indexes, RLS,
                           queue helpers, memory retention, logging,
-                          AI stats                       (run 1st)
+                          AI stats, activity + report tables   (run 1st)
 supabase/seed_replies.sql Fun action reply catalog        (run 2nd)
 
 db/                       Supabase client, config cache, Realtime listener
 services/                 Config writes, Groq client, rendering, QOTD scheduler,
-                          host rotation reminder
-cogs/                     config, general, fun, qotd, ai
-utils/                    Event logging, snowflake IDs, log setup
+                          host rotation reminder, activity tracker, moderation
+                          tracker, report service, report scheduler
+cogs/                     config, general, fun, qotd, ai, activity, report
+utils/                    Event logging, snowflake IDs, timezones, log setup
 supabase/functions/chat/                  The bot's Groq proxy
 supabase/functions/apply-guild-settings/  Dashboard settings write gate
 supabase/functions/sync-guilds/           Dashboard guild/permission sync

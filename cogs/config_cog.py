@@ -139,6 +139,11 @@ class ConfigCog(commands.Cog, name="Config"):
             "**Question of the Day**",
             f"Enabled: {'yes' if cfg.qotd_enabled else 'no'}  •  queued: {len(queue)}",
             "",
+            "**Monthly report**",
+            f"Enabled: {'yes' if cfg.report_enabled else 'no'}"
+            f"  •  channel: {f'<#{cfg.report_channel_id}>' if cfg.report_channel_id else 'not set'}"
+            f"  •  day {cfg.report_day}",
+            "",
             f"**Fun actions:** {len(actions)} available",
             "",
             "Everything here is also editable on the dashboard.",

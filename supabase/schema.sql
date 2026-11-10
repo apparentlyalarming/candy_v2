@@ -105,6 +105,17 @@ create table if not exists public.guild_settings (
     qotd_empty_queue_notice boolean not null default false,   -- notify if queue is empty at fire time
     qotd_last_fired_at      timestamptz,                      -- restart double-fire guard
 
+    -- monthly report + activity tracking ------------------------------------
+    report_enabled          boolean not null default false,   -- auto-post the monthly report
+    report_channel_id       bigint,                           -- where the report is posted
+    report_day              smallint not null default 1,      -- day of month, 1..28
+    report_time             time not null default '09:00',
+    report_timezone         text not null default 'UTC',      -- IANA name or fixed offset
+    report_last_generated_period date,                        -- period_start of the last auto-post
+    moderation_log_channel_id bigint,                         -- channel where Dyno posts mod logs
+    dyno_user_id            bigint not null default 155149108183695360, -- Dyno's public bot id
+    staff_role_ids          bigint[] not null default '{}',   -- roles counted as staff
+
     created_at              timestamptz not null default now(),
     updated_at              timestamptz not null default now(),
 
@@ -119,7 +130,9 @@ create table if not exists public.guild_settings (
     constraint guild_settings_cooldown_range
         check (ai_user_cooldown_seconds >= 0 and ai_user_cooldown_seconds <= 3600),
     constraint guild_settings_qotd_days_range
-        check (qotd_days <@ array[1,2,3,4,5,6,7]::integer[])
+        check (qotd_days <@ array[1,2,3,4,5,6,7]::integer[]),
+    constraint guild_settings_report_day_range
+        check (report_day >= 1 and report_day <= 28)
 );
 
 comment on table public.guild_settings is
@@ -409,6 +422,30 @@ alter table public.guild_settings
 
 alter table public.guild_settings
     add column if not exists ai_memory_ignored_channels bigint[] not null default '{}';
+
+-- Monthly report + activity tracking (added 2026-11-10). Repeated here because
+-- `create table if not exists` is a no-op on an existing database.
+alter table public.guild_settings
+    add column if not exists report_enabled          boolean  not null default false,
+    add column if not exists report_channel_id       bigint,
+    add column if not exists report_day              smallint not null default 1,
+    add column if not exists report_time             time     not null default '09:00',
+    add column if not exists report_timezone         text     not null default 'UTC',
+    add column if not exists report_last_generated_period date,
+    add column if not exists moderation_log_channel_id bigint,
+    add column if not exists dyno_user_id            bigint   not null default 155149108183695360,
+    add column if not exists staff_role_ids          bigint[] not null default '{}';
+
+do $$
+begin
+    if not exists (
+        select 1 from pg_constraint where conname = 'guild_settings_report_day_range'
+    ) then
+        alter table public.guild_settings
+            add constraint guild_settings_report_day_range
+            check (report_day >= 1 and report_day <= 28);
+    end if;
+end $$;
 
 -- The QOTD queue index predates the uniqueness requirement, so an existing
 -- database still has the non-unique version and `create unique index if not
@@ -1422,11 +1459,700 @@ alter table public.admin_requests force row level security;
 
 
 -- ============================================================================
+-- 07c  ACTIVITY TRACKING + MONTHLY REPORTS
+-- ============================================================================
+-- The bot keeps per-guild activity counters IN MEMORY and flushes them every
+-- few minutes with one RPC per guild (activity_flush). Nothing here is written
+-- per message, which is what makes this affordable on a 256 MB host.
+--
+-- Buckets are LOCAL days/hours in the guild's report_timezone, not UTC, so
+-- "most active day" and "most active time" mean what an admin expects.
+--
+-- No message text is stored anywhere in this section: counts only. Per-user
+-- rows hold a display-name snapshot so a report still reads correctly after a
+-- member leaves, and the name is refreshed at report time from Discord.
+--
+-- RLS is deny-all (no policies) like the operator tables. The dashboard is not
+-- wired to these tables yet; when it is, add SELECT policies via
+-- can_manage_guild() rather than opening them up.
+
+-- ---------------------------------------------------------------------------
+-- guild_daily_stats: one row per guild per local day
+-- ---------------------------------------------------------------------------
+create table if not exists public.guild_daily_stats (
+    guild_id           bigint not null references public.guilds(id) on delete cascade,
+    day                date   not null,
+    member_count       integer,                 -- snapshot at the last flush of the day
+    online_count       integer,                 -- NULL when the presence intent is off
+    boost_count        integer,                 -- current boost total at the last flush
+    joins              integer not null default 0,
+    leaves             integer not null default 0,
+    boosts_gained      integer not null default 0,
+    boosts_lost        integer not null default 0,
+    messages           integer not null default 0,
+    voice_seconds      bigint  not null default 0,
+    voice_joins        integer not null default 0,
+    bot_online_seconds integer not null default 0, -- how much of the day was actually observed
+    updated_at         timestamptz not null default now(),
+    primary key (guild_id, day)
+);
+
+comment on table public.guild_daily_stats is
+    'Per-guild daily activity totals. Written by activity_flush(); no message text.';
+comment on column public.guild_daily_stats.bot_online_seconds is
+    'Seconds the bot was actually connected and flushing this day. Used to disclose gaps in a report.';
+
+-- ---------------------------------------------------------------------------
+-- guild_channel_activity: per-channel, per-day totals
+-- ---------------------------------------------------------------------------
+create table if not exists public.guild_channel_activity (
+    guild_id      bigint not null references public.guilds(id) on delete cascade,
+    day           date   not null,
+    channel_id    bigint not null,
+    channel_name  text,                          -- snapshot, for reports after deletion
+    messages      integer not null default 0,
+    voice_seconds bigint  not null default 0,
+    voice_joins   integer not null default 0,
+    updated_at    timestamptz not null default now(),
+    primary key (guild_id, day, channel_id)
+);
+
+comment on table public.guild_channel_activity is
+    'Per-channel daily message/voice totals. channel_name is a display snapshot, not a live join.';
+
+-- ---------------------------------------------------------------------------
+-- guild_hourly_activity: per local hour, per day
+-- ---------------------------------------------------------------------------
+create table if not exists public.guild_hourly_activity (
+    guild_id      bigint not null references public.guilds(id) on delete cascade,
+    day           date   not null,
+    hour          smallint not null,             -- 0..23 local time
+    messages      integer not null default 0,
+    voice_seconds bigint  not null default 0,
+    updated_at    timestamptz not null default now(),
+    primary key (guild_id, day, hour),
+    constraint guild_hourly_activity_hour_range check (hour >= 0 and hour <= 23)
+);
+
+comment on table public.guild_hourly_activity is
+    'Per-local-hour activity buckets, used for "most active time" in the monthly report.';
+
+-- ---------------------------------------------------------------------------
+-- guild_member_activity: per-user, per-day totals
+-- ---------------------------------------------------------------------------
+create table if not exists public.guild_member_activity (
+    guild_id      bigint not null references public.guilds(id) on delete cascade,
+    day           date   not null,
+    user_id       bigint not null,
+    user_name     text,                          -- display-name snapshot
+    messages      integer not null default 0,
+    voice_seconds bigint  not null default 0,
+    voice_joins   integer not null default 0,
+    updated_at    timestamptz not null default now(),
+    primary key (guild_id, day, user_id)
+);
+
+comment on table public.guild_member_activity is
+    'Per-member daily activity counts. No content: messages and voice seconds only. Names are snapshots.';
+
+-- ---------------------------------------------------------------------------
+-- guild_boost_events: who boosted, and when
+-- ---------------------------------------------------------------------------
+create table if not exists public.guild_boost_events (
+    id          bigserial primary key,
+    guild_id    bigint not null references public.guilds(id) on delete cascade,
+    occurred_at timestamptz not null default now(),
+    user_id     bigint,
+    user_name   text,
+    kind        text not null,                   -- start | stop
+    source      text not null default 'gateway',
+    constraint guild_boost_events_kind_valid   check (kind in ('start','stop')),
+    constraint guild_boost_events_source_valid check (source in ('gateway','manual'))
+);
+
+create index if not exists guild_boost_events_guild_idx
+    on public.guild_boost_events (guild_id, occurred_at desc);
+
+comment on table public.guild_boost_events is
+    'One row per boost gained/lost, with the member who did it when Discord reports it.';
+
+-- ---------------------------------------------------------------------------
+-- guild_moderation_events: audit log + Dyno warnings
+-- ---------------------------------------------------------------------------
+-- SOURCE OF TRUTH PER ACTION:
+--   ban / unban / kick / timeout -> Discord audit log (source='audit')
+--   warn                         -> Dyno mod-log embed  (source='dyno_embed')
+--   anything entered by hand     -> source='manual'
+--
+-- A Dyno ban/kick embed is deliberately IGNORED: the audit log already records
+-- the action, so parsing both would double-count. The cost of that choice is
+-- that actions performed THROUGH Dyno name Dyno as the actor, not the human
+-- moderator; `via` records which case it was so a report can be honest about it.
+--
+-- external_id is the audit entry id or the Discord message id. The unique index
+-- is what makes re-polling and restarts idempotent.
+create table if not exists public.guild_moderation_events (
+    id             bigserial primary key,
+    guild_id       bigint not null references public.guilds(id) on delete cascade,
+    occurred_at    timestamptz not null default now(),
+    kind           text not null,                -- warn|timeout|kick|ban|unban|report|other
+    target_id      bigint,
+    target_name    text,
+    moderator_id   bigint,
+    moderator_name text,
+    reason         text,
+    source         text not null,                -- audit|dyno_embed|manual
+    via            text,                         -- native|dyno (who actually issued it)
+    external_id    text,                         -- audit entry id or Discord message id
+    case_number    integer,                      -- Dyno case number, informational only
+    raw_embed      jsonb,                        -- the original Dyno embed, for re-parsing
+    needs_review   boolean not null default false,
+    created_at     timestamptz not null default now(),
+    constraint guild_moderation_events_kind_valid
+        check (kind in ('warn','timeout','kick','ban','unban','report','other')),
+    constraint guild_moderation_events_source_valid
+        check (source in ('audit','dyno_embed','manual')),
+    constraint guild_moderation_events_via_valid
+        check (via is null or via in ('native','dyno')),
+    constraint guild_moderation_events_reason_length
+        check (reason is null or length(reason) <= 1000)
+);
+
+-- NULL external_id is allowed to repeat (manual rows); Postgres treats NULLs as
+-- distinct in a unique index, which is exactly what we want.
+create unique index if not exists guild_moderation_events_dedupe_idx
+    on public.guild_moderation_events (guild_id, source, external_id);
+
+create index if not exists guild_moderation_events_guild_idx
+    on public.guild_moderation_events (guild_id, occurred_at desc);
+
+create index if not exists guild_moderation_events_kind_idx
+    on public.guild_moderation_events (guild_id, kind, occurred_at desc);
+
+comment on table public.guild_moderation_events is
+    'Moderation actions for reports. Audit log for ban/kick/unban/timeout, Dyno embed for warnings.';
+
+-- ---------------------------------------------------------------------------
+-- guild_moderation_cursors: how far the audit-log poller has read
+-- ---------------------------------------------------------------------------
+create table if not exists public.guild_moderation_cursors (
+    guild_id      bigint primary key references public.guilds(id) on delete cascade,
+    last_audit_id bigint,
+    updated_at    timestamptz not null default now()
+);
+
+comment on table public.guild_moderation_cursors is
+    'Per-guild audit-log cursor. Advanced only after the corresponding events are written.';
+
+-- ---------------------------------------------------------------------------
+-- guild_events: scheduled events mirrored from Discord
+-- ---------------------------------------------------------------------------
+create table if not exists public.guild_events (
+    guild_id         bigint not null references public.guilds(id) on delete cascade,
+    event_id         bigint not null,
+    name             text,
+    description      text,
+    start_time       timestamptz,
+    end_time         timestamptz,
+    status           text,                       -- scheduled|active|completed|canceled
+    user_count       integer,
+    subscriber_count integer,
+    channel_id       bigint,
+    updated_at       timestamptz not null default now(),
+    primary key (guild_id, event_id),
+    constraint guild_events_status_valid
+        check (status is null or status in ('scheduled','active','completed','canceled'))
+);
+
+create index if not exists guild_events_start_idx
+    on public.guild_events (guild_id, start_time);
+
+comment on table public.guild_events is
+    'Discord scheduled events, mirrored so the monthly report can count them after they expire.';
+
+-- ---------------------------------------------------------------------------
+-- guild_reports: the generated monthly report
+-- ---------------------------------------------------------------------------
+-- auto_data is frozen JSON from the moment of generation, so a published report
+-- keeps its numbers even after retention prunes the source rows.
+-- narrative holds the human-written sections and is preserved across regenerates.
+create table if not exists public.guild_reports (
+    id                   bigserial primary key,
+    guild_id             bigint not null references public.guilds(id) on delete cascade,
+    period_start         date not null,
+    period_end           date not null,
+    status               text not null default 'draft',
+    prepared_by          text,
+    auto_data            jsonb not null default '{}'::jsonb,
+    narrative            jsonb not null default '{}'::jsonb,
+    markdown             text,
+    published_at         timestamptz,
+    published_channel_id bigint,
+    published_message_id bigint,
+    created_at           timestamptz not null default now(),
+    updated_at           timestamptz not null default now(),
+    unique (guild_id, period_start),
+    constraint guild_reports_status_valid check (status in ('draft','published')),
+    constraint guild_reports_period_order check (period_end >= period_start)
+);
+
+create index if not exists guild_reports_guild_idx
+    on public.guild_reports (guild_id, period_start desc);
+
+drop trigger if exists guild_reports_touch_updated_at on public.guild_reports;
+create trigger guild_reports_touch_updated_at
+    before update on public.guild_reports
+    for each row execute function public.touch_updated_at();
+
+comment on table public.guild_reports is
+    'Generated monthly reports. auto_data is a frozen snapshot; narrative is editable and survives regeneration.';
+
+-- ---------------------------------------------------------------------------
+-- RLS: deny-all, same reasoning as the operator tables.
+-- ---------------------------------------------------------------------------
+alter table public.guild_daily_stats         enable row level security;
+alter table public.guild_channel_activity    enable row level security;
+alter table public.guild_hourly_activity     enable row level security;
+alter table public.guild_member_activity     enable row level security;
+alter table public.guild_boost_events        enable row level security;
+alter table public.guild_moderation_events   enable row level security;
+alter table public.guild_moderation_cursors  enable row level security;
+alter table public.guild_events              enable row level security;
+alter table public.guild_reports             enable row level security;
+
+alter table public.guild_daily_stats         force row level security;
+alter table public.guild_channel_activity    force row level security;
+alter table public.guild_hourly_activity     force row level security;
+alter table public.guild_member_activity     force row level security;
+alter table public.guild_boost_events        force row level security;
+alter table public.guild_moderation_events   force row level security;
+alter table public.guild_moderation_cursors  force row level security;
+alter table public.guild_events              force row level security;
+alter table public.guild_reports             force row level security;
+
+
+-- ---------------------------------------------------------------------------
+-- activity_flush(): one atomic write per guild per flush
+-- ---------------------------------------------------------------------------
+-- The bot accumulates counters in memory and calls this every few minutes.
+-- Doing it in one function means one round trip per guild instead of one per
+-- channel/user/hour, and `on conflict do update set x = x + excluded.x` is
+-- atomic, so a retry can never double-count a flush that already landed.
+--
+-- Payload shape:
+--   {
+--     "day": "2026-11-10",
+--     "member_count": 123, "online_count": 45, "boost_count": 7,
+--     "daily": {"joins":0,"leaves":0,"boosts_gained":0,"boosts_lost":0,
+--               "messages":0,"voice_seconds":0,"voice_joins":0,
+--               "bot_online_seconds":300},
+--     "channels": [{"channel_id":1,"channel_name":"#general",
+--                   "messages":10,"voice_seconds":0,"voice_joins":0}],
+--     "hours":    [{"hour":13,"messages":10,"voice_seconds":0}],
+--     "members":  [{"user_id":1,"user_name":"x",
+--                   "messages":10,"voice_seconds":0,"voice_joins":0}]
+--   }
+create or replace function public.activity_flush(
+    p_guild_id bigint,
+    p_payload  jsonb
+)
+returns void
+language plpgsql
+security invoker
+set search_path = public
+as $$
+declare
+    v_day   date  := coalesce((p_payload->>'day')::date, current_date);
+    v_daily jsonb := coalesce(p_payload->'daily', '{}'::jsonb);
+    v_item  jsonb;
+begin
+    insert into public.guild_daily_stats as d (
+        guild_id, day, member_count, online_count, boost_count,
+        joins, leaves, boosts_gained, boosts_lost,
+        messages, voice_seconds, voice_joins, bot_online_seconds
+    ) values (
+        p_guild_id, v_day,
+        (p_payload->>'member_count')::integer,
+        (p_payload->>'online_count')::integer,
+        (p_payload->>'boost_count')::integer,
+        coalesce((v_daily->>'joins')::integer, 0),
+        coalesce((v_daily->>'leaves')::integer, 0),
+        coalesce((v_daily->>'boosts_gained')::integer, 0),
+        coalesce((v_daily->>'boosts_lost')::integer, 0),
+        coalesce((v_daily->>'messages')::integer, 0),
+        coalesce((v_daily->>'voice_seconds')::bigint, 0),
+        coalesce((v_daily->>'voice_joins')::integer, 0),
+        coalesce((v_daily->>'bot_online_seconds')::integer, 0)
+    )
+    on conflict (guild_id, day) do update set
+        member_count       = coalesce(excluded.member_count, d.member_count),
+        online_count       = coalesce(excluded.online_count, d.online_count),
+        boost_count        = coalesce(excluded.boost_count,  d.boost_count),
+        joins              = d.joins              + excluded.joins,
+        leaves             = d.leaves             + excluded.leaves,
+        boosts_gained      = d.boosts_gained      + excluded.boosts_gained,
+        boosts_lost        = d.boosts_lost        + excluded.boosts_lost,
+        messages           = d.messages           + excluded.messages,
+        voice_seconds      = d.voice_seconds      + excluded.voice_seconds,
+        voice_joins        = d.voice_joins        + excluded.voice_joins,
+        bot_online_seconds = d.bot_online_seconds + excluded.bot_online_seconds,
+        updated_at         = now();
+
+    for v_item in
+        select value from jsonb_array_elements(coalesce(p_payload->'channels', '[]'::jsonb))
+    loop
+        insert into public.guild_channel_activity as c (
+            guild_id, day, channel_id, channel_name, messages, voice_seconds, voice_joins
+        ) values (
+            p_guild_id, v_day,
+            (v_item->>'channel_id')::bigint,
+            nullif(v_item->>'channel_name', ''),
+            coalesce((v_item->>'messages')::integer, 0),
+            coalesce((v_item->>'voice_seconds')::bigint, 0),
+            coalesce((v_item->>'voice_joins')::integer, 0)
+        )
+        on conflict (guild_id, day, channel_id) do update set
+            channel_name  = coalesce(excluded.channel_name, c.channel_name),
+            messages      = c.messages      + excluded.messages,
+            voice_seconds = c.voice_seconds + excluded.voice_seconds,
+            voice_joins   = c.voice_joins   + excluded.voice_joins,
+            updated_at    = now();
+    end loop;
+
+    for v_item in
+        select value from jsonb_array_elements(coalesce(p_payload->'hours', '[]'::jsonb))
+    loop
+        insert into public.guild_hourly_activity as h (
+            guild_id, day, hour, messages, voice_seconds
+        ) values (
+            p_guild_id, v_day,
+            (v_item->>'hour')::smallint,
+            coalesce((v_item->>'messages')::integer, 0),
+            coalesce((v_item->>'voice_seconds')::bigint, 0)
+        )
+        on conflict (guild_id, day, hour) do update set
+            messages      = h.messages      + excluded.messages,
+            voice_seconds = h.voice_seconds + excluded.voice_seconds,
+            updated_at    = now();
+    end loop;
+
+    for v_item in
+        select value from jsonb_array_elements(coalesce(p_payload->'members', '[]'::jsonb))
+    loop
+        insert into public.guild_member_activity as m (
+            guild_id, day, user_id, user_name, messages, voice_seconds, voice_joins
+        ) values (
+            p_guild_id, v_day,
+            (v_item->>'user_id')::bigint,
+            nullif(v_item->>'user_name', ''),
+            coalesce((v_item->>'messages')::integer, 0),
+            coalesce((v_item->>'voice_seconds')::bigint, 0),
+            coalesce((v_item->>'voice_joins')::integer, 0)
+        )
+        on conflict (guild_id, day, user_id) do update set
+            user_name     = coalesce(excluded.user_name, m.user_name),
+            messages      = m.messages      + excluded.messages,
+            voice_seconds = m.voice_seconds + excluded.voice_seconds,
+            voice_joins   = m.voice_joins   + excluded.voice_joins,
+            updated_at    = now();
+    end loop;
+end;
+$$;
+
+comment on function public.activity_flush(bigint, jsonb) is
+    'Atomically merges one in-memory activity snapshot. One call per guild per flush.';
+
+revoke all on function public.activity_flush(bigint, jsonb) from public;
+grant execute on function public.activity_flush(bigint, jsonb) to service_role;
+
+
+-- ---------------------------------------------------------------------------
+-- activity_prune(): retention for the high-cardinality tables
+-- ---------------------------------------------------------------------------
+-- guild_daily_stats, reports, boosts and moderation events are kept. Only the
+-- per-channel/per-hour/per-member detail is aged out, because that is the part
+-- that grows with traffic. A published report keeps its own frozen copy.
+create or replace function public.activity_prune(
+    p_days integer default 400
+)
+returns integer
+language plpgsql
+security invoker
+set search_path = public
+as $$
+declare
+    v_days   integer := greatest(30, least(coalesce(p_days, 400), 3650));
+    v_cutoff date    := current_date - v_days;
+    v_total  integer := 0;
+    v_count  integer;
+begin
+    delete from public.guild_member_activity  where day < v_cutoff;
+    get diagnostics v_count = row_count;
+    v_total := v_total + v_count;
+
+    delete from public.guild_channel_activity where day < v_cutoff;
+    get diagnostics v_count = row_count;
+    v_total := v_total + v_count;
+
+    delete from public.guild_hourly_activity  where day < v_cutoff;
+    get diagnostics v_count = row_count;
+    v_total := v_total + v_count;
+
+    return v_total;
+end;
+$$;
+
+comment on function public.activity_prune(integer) is
+    'Deletes per-member/channel/hour activity older than p_days (clamped 30..3650). Daily totals and reports are kept.';
+
+revoke all on function public.activity_prune(integer) from public;
+grant execute on function public.activity_prune(integer) to service_role;
+
+
+-- ---------------------------------------------------------------------------
+-- report_summary(): every aggregate the markdown template needs, in one call
+-- ---------------------------------------------------------------------------
+-- Doing this in Postgres keeps a 256 MB bot host from pulling a month of
+-- per-member rows over the wire just to sum them.
+--
+-- p_start_at / p_end_at are the period boundaries in the GUILD's timezone,
+-- converted to UTC by the bot. They matter for timestamped rows (moderation,
+-- events); the daily/channel/member tables are already bucketed by local day.
+create or replace function public.report_summary(
+    p_guild_id bigint,
+    p_start    date,
+    p_end      date,
+    p_start_at timestamptz default null,
+    p_end_at   timestamptz default null
+)
+returns jsonb
+language plpgsql
+security invoker
+set search_path = public
+as $$
+declare
+    v_start_at timestamptz := coalesce(p_start_at, p_start::timestamptz);
+    v_end_at   timestamptz := coalesce(p_end_at, (p_end + 1)::timestamptz);
+begin
+    return (
+        with daily as (
+            select *
+              from public.guild_daily_stats
+             where guild_id = p_guild_id
+               and day between p_start and p_end
+        ),
+        totals as (
+            select
+                coalesce(sum(messages), 0)::bigint      as messages,
+                coalesce(sum(voice_seconds), 0)::bigint as voice_seconds,
+                coalesce(sum(voice_joins), 0)::bigint   as voice_joins,
+                coalesce(sum(joins), 0)::bigint         as joins,
+                coalesce(sum(leaves), 0)::bigint        as leaves,
+                coalesce(sum(boosts_gained), 0)::bigint as boosts_gained,
+                coalesce(sum(boosts_lost), 0)::bigint   as boosts_lost,
+                count(*)::bigint                        as days_tracked
+              from daily
+        ),
+        bounds as (
+            select
+                (select member_count from daily where member_count is not null
+                  order by day asc  limit 1) as member_start,
+                (select member_count from daily where member_count is not null
+                  order by day desc limit 1) as member_end,
+                (select boost_count  from daily where boost_count  is not null
+                  order by day desc limit 1) as boost_count
+        ),
+        top_day as (
+            select day, messages
+              from daily
+             order by messages desc, day asc
+             limit 1
+        ),
+        top_hour as (
+            select hour, sum(messages)::bigint as messages
+              from public.guild_hourly_activity
+             where guild_id = p_guild_id
+               and day between p_start and p_end
+             group by hour
+             order by sum(messages) desc, hour asc
+             limit 1
+        ),
+        channel_rows as (
+            select channel_id,
+                   max(channel_name)          as channel_name,
+                   sum(messages)::bigint      as messages,
+                   sum(voice_seconds)::bigint as voice_seconds,
+                   sum(voice_joins)::bigint   as voice_joins
+              from public.guild_channel_activity
+             where guild_id = p_guild_id
+               and day between p_start and p_end
+             group by channel_id
+        ),
+        top_channels as (
+            select coalesce(
+                       jsonb_agg(to_jsonb(x) order by x.messages desc, x.channel_id),
+                       '[]'::jsonb) as data
+              from (select * from channel_rows
+                     order by messages desc, channel_id
+                     limit 5) x
+        ),
+        top_voice_channels as (
+            select coalesce(
+                       jsonb_agg(to_jsonb(x) order by x.voice_seconds desc, x.channel_id),
+                       '[]'::jsonb) as data
+              from (select * from channel_rows
+                     where voice_seconds > 0
+                     order by voice_seconds desc, channel_id
+                     limit 5) x
+        ),
+        member_rows as (
+            select user_id,
+                   max(user_name)             as user_name,
+                   sum(messages)::bigint      as messages,
+                   sum(voice_seconds)::bigint as voice_seconds
+              from public.guild_member_activity
+             where guild_id = p_guild_id
+               and day between p_start and p_end
+             group by user_id
+        ),
+        top_message_users as (
+            select coalesce(
+                       jsonb_agg(to_jsonb(x) order by x.messages desc, x.user_id),
+                       '[]'::jsonb) as data
+              from (select * from member_rows
+                     where messages > 0
+                     order by messages desc, user_id
+                     limit 10) x
+        ),
+        top_voice_users as (
+            select coalesce(
+                       jsonb_agg(to_jsonb(x) order by x.voice_seconds desc, x.user_id),
+                       '[]'::jsonb) as data
+              from (select * from member_rows
+                     where voice_seconds > 0
+                     order by voice_seconds desc, user_id
+                     limit 10) x
+        ),
+        moderation as (
+            select
+                count(*) filter (where kind = 'warn')::bigint    as warns,
+                count(*) filter (where kind = 'timeout')::bigint as timeouts,
+                count(*) filter (where kind = 'kick')::bigint    as kicks,
+                count(*) filter (where kind = 'ban')::bigint     as bans,
+                count(*) filter (where kind = 'unban')::bigint   as unbans,
+                count(*) filter (where kind = 'report')::bigint  as reports,
+                count(*) filter (where via = 'dyno')::bigint     as via_dyno,
+                count(*) filter (where via = 'native')::bigint   as via_native
+              from public.guild_moderation_events
+             where guild_id = p_guild_id
+               and occurred_at >= v_start_at
+               and occurred_at <  v_end_at
+        ),
+        staff_actions as (
+            select coalesce(
+                       jsonb_agg(to_jsonb(x) order by x.actions desc, x.moderator_id),
+                       '[]'::jsonb) as data
+              from (
+                    select moderator_id,
+                           max(moderator_name) as moderator_name,
+                           count(*)::bigint    as actions
+                      from public.guild_moderation_events
+                     where guild_id = p_guild_id
+                       and occurred_at >= v_start_at
+                       and occurred_at <  v_end_at
+                       and kind in ('warn','timeout','kick','ban')
+                     group by moderator_id, moderator_name
+                     order by count(*) desc, moderator_id
+                     limit 10
+              ) x
+        ),
+        event_totals as (
+            select
+                count(*) filter (
+                    where start_time >= v_start_at and start_time < v_end_at
+                )::bigint as hosted,
+                coalesce(sum(user_count) filter (
+                    where start_time >= v_start_at and start_time < v_end_at
+                ), 0)::bigint as participation,
+                count(*) filter (
+                    where start_time >= v_start_at and start_time < v_end_at
+                      and (status = 'completed'
+                           or (end_time is not null and end_time < now()))
+                )::bigint as successful
+              from public.guild_events
+             where guild_id = p_guild_id
+        ),
+        upcoming as (
+            select coalesce(
+                       jsonb_agg(to_jsonb(x) order by x.start_time),
+                       '[]'::jsonb) as data
+              from (
+                    select event_id, name, start_time, status
+                      from public.guild_events
+                     where guild_id = p_guild_id
+                       and start_time > now()
+                     order by start_time
+                     limit 5
+              ) x
+        )
+        select jsonb_build_object(
+            'guild_id', p_guild_id,
+            'period_start', p_start,
+            'period_end', p_end,
+            'member_start', (select member_start from bounds),
+            'member_end',   (select member_end   from bounds),
+            'member_growth',
+                case
+                    when (select member_end from bounds) is not null
+                     and (select member_start from bounds) is not null
+                    then (select member_end from bounds)
+                       - (select member_start from bounds)
+                end,
+            'boost_count',      (select boost_count      from bounds),
+            'total_messages',   (select messages          from totals),
+            'total_voice_seconds', (select voice_seconds  from totals),
+            'voice_joins',      (select voice_joins       from totals),
+            'total_joins',      (select joins             from totals),
+            'total_leaves',     (select leaves            from totals),
+            'boosts_gained',    (select boosts_gained     from totals),
+            'boosts_lost',      (select boosts_lost       from totals),
+            'days_tracked',     (select days_tracked      from totals),
+            'most_active_day',
+                (select jsonb_build_object('day', day, 'messages', messages)
+                   from top_day),
+            'most_active_hour',
+                (select jsonb_build_object('hour', hour, 'messages', messages)
+                   from top_hour),
+            'top_channels',       (select data from top_channels),
+            'top_voice_channels', (select data from top_voice_channels),
+            'top_message_users',  (select data from top_message_users),
+            'top_voice_users',    (select data from top_voice_users),
+            'moderation',         (select to_jsonb(moderation) from moderation),
+            'staff_actions',      (select data from staff_actions),
+            'events', jsonb_build_object(
+                'hosted',        (select hosted        from event_totals),
+                'participation', (select participation from event_totals),
+                'successful',    (select successful    from event_totals),
+                'upcoming',      (select data          from upcoming)
+            )
+        )
+    );
+end;
+$$;
+
+comment on function public.report_summary(bigint, date, date, timestamptz, timestamptz) is
+    'One-call aggregate for the monthly report template. Counts only, no message text.';
+
+revoke all on function public.report_summary(bigint, date, date, timestamptz, timestamptz) from public;
+grant execute on function public.report_summary(bigint, date, date, timestamptz, timestamptz) to service_role;
+
+
+-- ============================================================================
 -- 08  VERIFICATION QUERIES
 -- ============================================================================
 -- Run these after the script to confirm everything landed.
 
--- 08.1 Tables exist (expect 16 rows)
+-- 08.1 Tables exist (expect 25 rows)
 -- select tablename
 --   from pg_tables
 --  where schemaname = 'public'
@@ -1434,17 +2160,25 @@ alter table public.admin_requests force row level security;
 --                      'reply_actions','guild_replies','qotd_questions',
 --                      'ai_memory','ai_interactions','bot_events','dev_users',
 --                      'user_preferences','bot_dms','bot_dm_outbox',
---                      'admin_audit','admin_requests')
+--                      'admin_audit','admin_requests',
+--                      'guild_daily_stats','guild_channel_activity',
+--                      'guild_hourly_activity','guild_member_activity',
+--                      'guild_boost_events','guild_moderation_events',
+--                      'guild_moderation_cursors','guild_events','guild_reports')
 --  order by tablename;
 
--- 08.2 RLS enabled on all 16 (expect rls_enabled = true everywhere)
+-- 08.2 RLS enabled on all 25 (expect rls_enabled = true everywhere)
 -- select relname as table_name, relrowsecurity as rls_enabled, relforcerowsecurity as rls_forced
 --   from pg_class
 --  where relname in ('guilds','guild_settings','user_guilds',
 --                    'reply_actions','guild_replies','qotd_questions',
 --                    'ai_memory','ai_interactions','bot_events','dev_users',
 --                    'user_preferences','bot_dms','bot_dm_outbox',
---                    'admin_audit','admin_requests');
+--                    'admin_audit','admin_requests',
+--                    'guild_daily_stats','guild_channel_activity',
+--                    'guild_hourly_activity','guild_member_activity',
+--                    'guild_boost_events','guild_moderation_events',
+--                    'guild_moderation_cursors','guild_events','guild_reports');
 
 -- 08.3 Policy count per table (expect a sensible number for the user-facing
 --      tables and ZERO for the operator tables, which are deny-all by design).
@@ -1490,7 +2224,11 @@ alter table public.admin_requests force row level security;
 --           ('ai_memory_ignored_channels'),('ai_user_cooldown_seconds'),
 --           ('ai_all_channels'),('ai_channel_ids'),('qotd_enabled'),
 --           ('qotd_channel_id'),('qotd_role_id'),('qotd_time'),('qotd_timezone'),
---           ('qotd_days'),('qotd_empty_queue_notice'),('qotd_last_fired_at')
+--           ('qotd_days'),('qotd_empty_queue_notice'),('qotd_last_fired_at'),
+--           ('report_enabled'),('report_channel_id'),('report_day'),
+--           ('report_time'),('report_timezone'),
+--           ('report_last_generated_period'),('moderation_log_channel_id'),
+--           ('dyno_user_id'),('staff_role_ids')
 --        ) as missing(column_name)
 --  where not exists (
 --        select 1 from information_schema.columns

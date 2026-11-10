@@ -46,6 +46,12 @@ COOLDOWN_MAX = 3600
 MEMORY_TURN_MAX_CHARS = 2000
 QOTD_DAYS_VALID = {1, 2, 3, 4, 5, 6, 7}
 
+# Monthly report schedule. Day 29-31 is deliberately disallowed: those dates do
+# not exist in every month, and a report that silently skips February is worse
+# than one that runs on the 28th.
+REPORT_DAY_MIN = 1
+REPORT_DAY_MAX = 28
+
 
 class ConfigError(ValueError):
     """Raised when a proposed configuration value is invalid."""
@@ -900,6 +906,75 @@ class ConfigService:
         self._update_settings(
             guild_id, {"qotd_last_fired_at": datetime.now(timezone.utc).isoformat()}
         )
+
+    # ------------------------------------------------------------------
+    # monthly report + activity tracking
+    # ------------------------------------------------------------------
+
+    def set_report_enabled(self, guild_id: int, enabled: bool) -> None:
+        self._update_settings(guild_id, {"report_enabled": bool(enabled)})
+
+    def set_report_channel(self, guild_id: int, channel_id: Any | None) -> None:
+        self._update_settings(guild_id, {"report_channel_id": to_id(channel_id)})
+
+    def set_report_day(self, guild_id: int, day: int) -> None:
+        _check_range("report day", day, REPORT_DAY_MIN, REPORT_DAY_MAX)
+        self._update_settings(guild_id, {"report_day": int(day)})
+
+    def set_report_time(self, guild_id: int, hour: int, minute: int = 0) -> None:
+        if not (0 <= hour <= 23):
+            raise ConfigError("hour must be between 0 and 23")
+        if not (0 <= minute <= 59):
+            raise ConfigError("minute must be between 0 and 59")
+        self._update_settings(guild_id, {"report_time": f"{hour:02d}:{minute:02d}:00"})
+
+    def set_report_timezone(self, guild_id: int, timezone_name: str) -> None:
+        """Accepts an IANA name or a fixed offset, like the QOTD timezone."""
+        try:
+            stored = normalize_timezone_input(timezone_name)
+        except _InputTimezoneError as exc:
+            raise TimezoneError(str(exc)) from exc
+        self._update_settings(guild_id, {"report_timezone": stored})
+
+    def set_report_last_generated_period(self, guild_id: int, period_start: Any) -> None:
+        """Stamp the period_start of the last automatic report.
+
+        Stored as a plain date string so the scheduler can compare it without
+        parsing a timestamp.
+        """
+        if period_start is None:
+            value: str | None = None
+        else:
+            value = str(period_start)[:10]
+        self._update_settings(guild_id, {"report_last_generated_period": value})
+
+    def set_moderation_log_channel(self, guild_id: int, channel_id: Any | None) -> None:
+        self._update_settings(guild_id, {"moderation_log_channel_id": to_id(channel_id)})
+
+    def set_dyno_user_id(self, guild_id: int, user_id: Any | None) -> None:
+        """Override which bot is treated as Dyno for the mod-log parser."""
+        target = to_id(user_id)
+        if target is None:
+            raise ConfigError("dyno user id must be a Discord user ID")
+        self._update_settings(guild_id, {"dyno_user_id": target})
+
+    def set_staff_role_ids(self, guild_id: int, role_ids: Iterable[Any] | None) -> None:
+        resolved = to_id_list(role_ids or [])
+        self._update_settings(guild_id, {"staff_role_ids": resolved})
+
+    def add_staff_role(self, guild_id: int, role_id: Any) -> None:
+        current = set(self.get(guild_id).staff_role_ids)
+        target = to_id(role_id)
+        if target is None:
+            raise ConfigError("invalid role id")
+        current.add(target)
+        self.set_staff_role_ids(guild_id, current)
+
+    def remove_staff_role(self, guild_id: int, role_id: Any) -> None:
+        current = set(self.get(guild_id).staff_role_ids)
+        target = to_id(role_id)
+        current.discard(target)
+        self.set_staff_role_ids(guild_id, current)
 
 
 # --- helpers ----------------------------------------------------------------
