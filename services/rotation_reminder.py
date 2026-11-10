@@ -543,8 +543,8 @@ class RotationReminder:
             # Prefer the team owner, else the first member.
             for member in info.team.members:
                 if member.id == getattr(info.team, "owner_id", None):
-                    return member
-            return info.team.members[0]
+                    return member.user
+            return info.team.members[0].user
 
         if info.owner is not None:
             self._owner_ids = {info.owner.id}
