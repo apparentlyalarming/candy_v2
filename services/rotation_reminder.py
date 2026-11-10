@@ -541,10 +541,18 @@ class RotationReminder:
         if info.team is not None and info.team.members:
             self._owner_ids = {m.id for m in info.team.members}
             # Prefer the team owner, else the first member.
+            owner_id = None
             for member in info.team.members:
                 if member.id == getattr(info.team, "owner_id", None):
-                    return member.user
-            return info.team.members[0].user
+                    owner_id = member.id
+                    break
+            if owner_id is None:
+                owner_id = info.team.members[0].id
+            try:
+                return self._bot.get_user(owner_id) or await self._bot.fetch_user(owner_id)
+            except discord.HTTPException as exc:
+                log.warning("Could not resolve application team owner %s: %s", owner_id, exc)
+                return None
 
         if info.owner is not None:
             self._owner_ids = {info.owner.id}

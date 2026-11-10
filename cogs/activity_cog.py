@@ -154,10 +154,11 @@ class ActivityCog(commands.Cog, name="Activity"):
     def _seed_voice(self, guild: discord.Guild) -> None:
         assert self.tracker is not None
         states = {
-            user_id: state
-            for user_id, state in guild.voice_states.items()
-            if state.channel is not None
-            and not (state.member is not None and state.member.bot)
+            member.id: state
+            for member in guild.members
+            if not member.bot
+            and (state := member.voice) is not None
+            and state.channel is not None
         }
         self.tracker.seed_voice_states(guild.id, states)
 

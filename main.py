@@ -86,6 +86,7 @@ class CandyBot(commands.Bot):
         intents.message_content = True
         intents.members = True
         intents.guilds = True
+        intents.voice_states = True
         intents.presences = presence_intent
 
         super().__init__(
