@@ -101,7 +101,6 @@ class GeneralCog(commands.Cog, name="General"):
         cfg = self.config.get(guild_id) if guild_id is not None else None
         prefix = cfg.prefix if cfg is not None else "!"
         prefix_enabled = cfg.prefix_enabled if cfg is not None else True
-        prefix_example = f"`{prefix}candy`"
 
         if prefix_enabled:
             if cfg is None:
@@ -145,16 +144,21 @@ class GeneralCog(commands.Cog, name="General"):
             inline=False,
         )
 
-        embed.add_field(
-            name="💬 General",
-            value=(
-                "`/hello` - say hi to me\n"
-                "`/help` - show this menu\n"
-                "`/ask` - ask me anything\n"
-                f"`@Candy` or {prefix_example} - chat with me\n"
+        general = (
+            "`/hello` - say hi to me\n"
+            "`/help` - show this menu\n"
+            "`/ask` - ask me anything\n"
+            "`@Candy` - chat with me"
+        )
+        if prefix_enabled:
+            general += (
+                f"\n`{prefix}candy` - chat with me as a text command\n"
                 f"`{prefix}candyp` - same, but I weigh your own history too\n"
                 f"`{prefix}help` - this menu as a text command"
-            ),
+            )
+        embed.add_field(
+            name="💬 General",
+            value=general,
             inline=False,
         )
 
@@ -167,13 +171,15 @@ class GeneralCog(commands.Cog, name="General"):
 
         if actions:
             names = "  ".join(f"`/{a.get('key')}`" for a in actions)
+            hint = (
+                "All of these also work as text commands if prefix commands "
+                "are enabled."
+                if prefix_enabled
+                else "These are slash commands only on this server."
+            )
             embed.add_field(
                 name="🎉 Fun & Interaction",
-                value=(
-                    f"{names}\n\n"
-                    "All of these also work as text commands if prefix commands "
-                    "are enabled."
-                ),
+                value=f"{names}\n\n{hint}",
                 inline=False,
             )
 
@@ -186,11 +192,16 @@ class GeneralCog(commands.Cog, name="General"):
                     "`/config chat` - AI model, prompt, channels, memory\n"
                     "`/config replies` - customise fun action replies\n"
                     "`/config qotd` - Question of the Day\n"
-                    "`/report` - monthly server report: generate, edit, publish\n"
+                    "`/report generate` - build a draft for a month\n"
+                    "`/report preview` - check the numbers without saving\n"
+                    "`/report edit` - write the human sections\n"
+                    "`/report view` - show the stored copy\n"
+                    "`/report publish` - post it; publishing again edits the post\n"
                     "`/report test` - check the report setup and post a test message\n"
                     "`/config report` - report schedule, channel and data sources\n"
                     f"`{prefix}memory on|off` - toggle the AI's memory\n"
-                    f"`{prefix}log` - summarise this ticket channel into a JSON file"
+                    f"`{prefix}log` - summarise this ticket channel into a JSON file\n"
+                    f"  (Manage Server only, in a `ticket…` channel)"
                 ),
                 inline=False,
             )
