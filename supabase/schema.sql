@@ -1667,6 +1667,15 @@ create table if not exists public.guild_events (
 create index if not exists guild_events_start_idx
     on public.guild_events (guild_id, start_time);
 
+-- Discord stops returning an event once it ends or is deleted. Deleting the
+-- row would erase exactly the history this table exists to keep, so the sync
+-- marks it instead.
+alter table public.guild_events
+    add column if not exists removed_at timestamptz;
+
+comment on column public.guild_events.removed_at is
+    'Set when Discord no longer returns the event. The row is kept so past events still count.';
+
 comment on table public.guild_events is
     'Discord scheduled events, mirrored so the monthly report can count them after they expire.';
 
@@ -1708,6 +1717,48 @@ comment on table public.guild_reports is
     'Generated monthly reports. auto_data is a frozen snapshot; narrative is editable and survives regeneration.';
 
 -- ---------------------------------------------------------------------------
+-- guild_ticket_logs: summaries produced by the !log command
+-- ---------------------------------------------------------------------------
+-- The JSON file posted to the ticket channel is also stored here, so the
+-- monthly report can count tickets handled and the dashboard can query past
+-- summaries. `summary` holds exactly the four keys the model is asked for:
+-- {"people_involved": [...], "when": "...", "why": "...", "ticket_type": "..."}.
+--
+-- Every ticket channel is named `ticket-0001`, and that number restarts per
+-- ticket type, so the name is neither a type nor a unique ticket id. The type
+-- is inferred from the conversation and copied into `ticket_type` for cheap
+-- grouping; `channel_id` is what actually distinguishes recurring names.
+create table if not exists public.guild_ticket_logs (
+    id                bigserial primary key,
+    guild_id          bigint not null references public.guilds(id) on delete cascade,
+    channel_id        bigint not null,
+    channel_name      text,
+    ticket_type       text,
+    generated_by      bigint,
+    generated_by_name text,
+    message_count     integer not null default 0,
+    summary           jsonb not null default '{}'::jsonb,
+    created_at        timestamptz not null default now()
+);
+
+-- `create table if not exists` is a no-op on an existing database, so a column
+-- added after the first deploy needs its own statement.
+alter table public.guild_ticket_logs
+    add column if not exists ticket_type text;
+
+create index if not exists guild_ticket_logs_guild_idx
+    on public.guild_ticket_logs (guild_id, created_at desc);
+
+create index if not exists guild_ticket_logs_channel_idx
+    on public.guild_ticket_logs (guild_id, channel_id, created_at desc);
+
+create index if not exists guild_ticket_logs_type_idx
+    on public.guild_ticket_logs (guild_id, ticket_type, created_at desc);
+
+comment on table public.guild_ticket_logs is
+    'AI summaries of ticket channels exported with !log. summary is the exact four-key JSON sent to Discord; ticket_type is copied out for report grouping.';
+
+-- ---------------------------------------------------------------------------
 -- RLS: deny-all, same reasoning as the operator tables.
 -- ---------------------------------------------------------------------------
 alter table public.guild_daily_stats         enable row level security;
@@ -1719,6 +1770,7 @@ alter table public.guild_moderation_events   enable row level security;
 alter table public.guild_moderation_cursors  enable row level security;
 alter table public.guild_events              enable row level security;
 alter table public.guild_reports             enable row level security;
+alter table public.guild_ticket_logs         enable row level security;
 
 alter table public.guild_daily_stats         force row level security;
 alter table public.guild_channel_activity    force row level security;
@@ -1729,6 +1781,7 @@ alter table public.guild_moderation_events   force row level security;
 alter table public.guild_moderation_cursors  force row level security;
 alter table public.guild_events              force row level security;
 alter table public.guild_reports             force row level security;
+alter table public.guild_ticket_logs         force row level security;
 
 
 -- ---------------------------------------------------------------------------
@@ -1950,6 +2003,8 @@ begin
                 coalesce(sum(leaves), 0)::bigint        as leaves,
                 coalesce(sum(boosts_gained), 0)::bigint as boosts_gained,
                 coalesce(sum(boosts_lost), 0)::bigint   as boosts_lost,
+                coalesce(sum(bot_online_seconds), 0)::bigint
+                                                        as bot_online_seconds,
                 count(*)::bigint                        as days_tracked
               from daily
         ),
@@ -2033,6 +2088,30 @@ begin
                      order by voice_seconds desc, user_id
                      limit 10) x
         ),
+        ticket_rows as (
+            -- One ticket channel can be exported more than once (for example,
+            -- after more messages arrive). Count the channel once, using its
+            -- latest summary, so the total and the per-type breakdown agree.
+            select distinct on (channel_id)
+                   channel_id,
+                   coalesce(nullif(ticket_type, ''), 'Other') as ticket_type
+              from public.guild_ticket_logs
+             where guild_id = p_guild_id
+               and created_at >= v_start_at
+               and created_at <  v_end_at
+             order by channel_id, created_at desc
+        ),
+        ticket_totals as (
+            select
+                coalesce(sum(n), 0)::bigint                 as total,
+                coalesce(jsonb_object_agg(ticket_type, n),
+                         '{}'::jsonb)                       as by_type
+              from (
+                    select ticket_type, count(*)::bigint as n
+                      from ticket_rows
+                     group by ticket_type
+              ) x
+        ),
         moderation as (
             select
                 count(*) filter (where kind = 'warn')::bigint    as warns,
@@ -2040,9 +2119,18 @@ begin
                 count(*) filter (where kind = 'kick')::bigint    as kicks,
                 count(*) filter (where kind = 'ban')::bigint     as bans,
                 count(*) filter (where kind = 'unban')::bigint   as unbans,
-                count(*) filter (where kind = 'report')::bigint  as reports,
+                -- Nothing writes kind='report': this bot has no "report a
+                -- user" command, so the old filter was always zero. The
+                -- meaningful count is the tickets the AI classified as a
+                -- user report, which !log now produces.
+                coalesce(
+                    (select (by_type->>'Reporting a user')::bigint
+                       from ticket_totals),
+                    0)::bigint                                   as reports,
                 count(*) filter (where via = 'dyno')::bigint     as via_dyno,
-                count(*) filter (where via = 'native')::bigint   as via_native
+                count(*) filter (where via = 'native')::bigint   as via_native,
+                (select total   from ticket_totals)             as tickets_logged,
+                (select by_type from ticket_totals)             as tickets_by_type
               from public.guild_moderation_events
              where guild_id = p_guild_id
                and occurred_at >= v_start_at
@@ -2090,6 +2178,7 @@ begin
                     select event_id, name, start_time, status
                       from public.guild_events
                      where guild_id = p_guild_id
+                       and removed_at is null
                        and start_time > now()
                      order by start_time
                      limit 5
@@ -2116,6 +2205,7 @@ begin
             'total_leaves',     (select leaves            from totals),
             'boosts_gained',    (select boosts_gained     from totals),
             'boosts_lost',      (select boosts_lost       from totals),
+            'bot_online_seconds', (select bot_online_seconds from totals),
             'days_tracked',     (select days_tracked      from totals),
             'most_active_day',
                 (select jsonb_build_object('day', day, 'messages', messages)
@@ -2152,7 +2242,7 @@ grant execute on function public.report_summary(bigint, date, date, timestamptz,
 -- ============================================================================
 -- Run these after the script to confirm everything landed.
 
--- 08.1 Tables exist (expect 25 rows)
+-- 08.1 Tables exist (expect 26 rows)
 -- select tablename
 --   from pg_tables
 --  where schemaname = 'public'
@@ -2164,10 +2254,11 @@ grant execute on function public.report_summary(bigint, date, date, timestamptz,
 --                      'guild_daily_stats','guild_channel_activity',
 --                      'guild_hourly_activity','guild_member_activity',
 --                      'guild_boost_events','guild_moderation_events',
---                      'guild_moderation_cursors','guild_events','guild_reports')
+--                      'guild_moderation_cursors','guild_events','guild_reports',
+--                      'guild_ticket_logs')
 --  order by tablename;
 
--- 08.2 RLS enabled on all 25 (expect rls_enabled = true everywhere)
+-- 08.2 RLS enabled on all 26 (expect rls_enabled = true everywhere)
 -- select relname as table_name, relrowsecurity as rls_enabled, relforcerowsecurity as rls_forced
 --   from pg_class
 --  where relname in ('guilds','guild_settings','user_guilds',
@@ -2178,7 +2269,8 @@ grant execute on function public.report_summary(bigint, date, date, timestamptz,
 --                    'guild_daily_stats','guild_channel_activity',
 --                    'guild_hourly_activity','guild_member_activity',
 --                    'guild_boost_events','guild_moderation_events',
---                    'guild_moderation_cursors','guild_events','guild_reports');
+--                    'guild_moderation_cursors','guild_events','guild_reports',
+--                    'guild_ticket_logs');
 
 -- 08.3 Policy count per table (expect a sensible number for the user-facing
 --      tables and ZERO for the operator tables, which are deny-all by design).

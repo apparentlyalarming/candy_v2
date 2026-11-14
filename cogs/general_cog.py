@@ -17,12 +17,16 @@ them would advertise commands they cannot use.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from services import ticket_log
 from services.config_service import ConfigService
+from services.groq_service import GroqError, GroqRateLimited, GroqUnavailable
 from utils.logging_setup import get_logger
 
 log = get_logger("cogs.general")
@@ -32,6 +36,9 @@ SYNC_TIMEOUT_SECONDS = 60
 
 # Brand colour, shared by every help surface.
 BRAND_COLOUR = discord.Colour.from_str("#FFB6C1")
+
+# How long a refused !log message lingers before cleaning itself up.
+TEMPORARY_REPLY_SECONDS = 8.0
 
 
 def is_admin(member: discord.abc.User | discord.Member | None) -> bool:
@@ -54,6 +61,9 @@ class GeneralCog(commands.Cog, name="General"):
     def __init__(self, bot: commands.Bot, config_service: ConfigService) -> None:
         self.bot = bot
         self.config = config_service
+        # Strong references to fire-and-forget cleanup tasks, so they are not
+        # garbage-collected before their sleep finishes.
+        self._background_tasks: set[asyncio.Task] = set()
 
     # ==================================================================
     # slash commands
@@ -179,7 +189,8 @@ class GeneralCog(commands.Cog, name="General"):
                     "`/report` - monthly server report: generate, edit, publish\n"
                     "`/report test` - check the report setup and post a test message\n"
                     "`/config report` - report schedule, channel and data sources\n"
-                    f"`{prefix}memory on|off` - toggle the AI's memory"
+                    f"`{prefix}memory on|off` - toggle the AI's memory\n"
+                    f"`{prefix}log` - summarise this ticket channel into a JSON file"
                 ),
                 inline=False,
             )
@@ -395,6 +406,12 @@ class GeneralCog(commands.Cog, name="General"):
                 await self._handle_memory_prefix(message, body, prefix)
                 return
 
+            # !log - summarise this ticket channel into a JSON file. The handler
+            # re-checks the ticket- prefix and the Manage Server gate itself.
+            if body.split()[0:1] == ["log"]:
+                await self._handle_log_prefix(message)
+                return
+
             # !help - the prefix twin of /help. Same builder, so the two surfaces
             # can never drift.
             if body.split()[0:1] == ["help"]:
@@ -521,6 +538,131 @@ class GeneralCog(commands.Cog, name="General"):
                 channel_id=message.channel.id,
                 metadata={"source": "prefix memory"},
             )
+
+    async def _handle_log_prefix(self, message: discord.Message) -> None:
+        """Export a ticket channel as a four-key JSON summary.
+
+        Only channels whose name starts with ``ticket`` are eligible, and only
+        Manage Server members may run it: the transcript can contain private
+        conversations. The file is generated in memory and never touches disk.
+        """
+        channel = message.channel
+        channel_name = getattr(channel, "name", "") or ""
+
+        if not channel_name.startswith("ticket"):
+            await self._send_temporary_reply(
+                message, "This command only works in a ticket channel."
+            )
+            return
+
+        if not is_admin(message.author):
+            await self._send_temporary_reply(
+                message, "You need **Manage Server** to export a ticket log."
+            )
+            return
+
+        groq = getattr(self.bot, "groq_service", None)
+        if groq is None:
+            await self._send_temporary_reply(
+                message, "AI summaries are not configured on this bot."
+            )
+            return
+
+        status = await message.reply("⏳ Processing...", mention_author=False)
+
+        try:
+            transcript = await ticket_log.fetch_transcript(channel)
+            if transcript.message_count == 0:
+                await status.edit(
+                    content="There are no messages in this ticket to summarise."
+                )
+                return
+
+            summary = await ticket_log.summarize_ticket(groq, transcript=transcript.text)
+
+            saved = True
+            try:
+                await ticket_log.record_ticket_log(
+                    guild_id=message.guild.id,
+                    channel_id=channel.id,
+                    channel_name=channel_name,
+                    generated_by=message.author.id,
+                    generated_by_name=str(message.author),
+                    message_count=transcript.message_count,
+                    summary=summary,
+                )
+            except Exception as exc:  # noqa: BLE001 - the file still has value
+                saved = False
+                log.error(
+                    "Could not save ticket log for channel %s: %s",
+                    channel.id,
+                    exc,
+                    exc_info=True,
+                )
+
+            # StringIO keeps the document in memory; BytesIO is what discord.py
+            # needs, because aiohttp uploads binary chunks.
+            ticket_type = summary.get("ticket_type") or "Other"
+            document = io.StringIO(ticket_log.render_log_json(summary))
+            file = discord.File(
+                io.BytesIO(document.getvalue().encode("utf-8")),
+                filename=ticket_log.filename_for(channel_name, ticket_type),
+            )
+
+            note = " and saved to the dashboard" if saved else ""
+            # Attach the file to the status message itself, so the result and
+            # the document are one message instead of a lingering "Processing".
+            await status.edit(
+                content=(
+                    f"✅ **{ticket_type}** ticket log ready{note} "
+                    f"({transcript.message_count} messages)."
+                ),
+                attachments=[file],
+            )
+
+        except discord.Forbidden:
+            await status.edit(
+                content=(
+                    "I'm missing a permission here. I need **Read Message "
+                    "History** to read the ticket and **Attach Files** to post "
+                    "the JSON."
+                )
+            )
+        except GroqRateLimited as exc:
+            retry = f" Try again in about {exc.retry_after:.0f}s." if exc.retry_after else ""
+            await status.edit(content=f"⏳ The AI is rate limited right now.{retry}")
+        except (GroqUnavailable, GroqError) as exc:
+            log.warning("Ticket log AI call failed: %s", exc)
+            await status.edit(content=f"❌ Could not summarise the ticket: {exc}")
+        except ticket_log.TicketLogError as exc:
+            await status.edit(content=f"❌ {exc}")
+        except Exception as exc:  # noqa: BLE001 - never crash the dispatcher
+            log.error("Ticket log generation failed: %s", exc, exc_info=True)
+            await status.edit(
+                content="❌ Could not generate the log. Check the bot logs."
+            )
+
+    async def _send_temporary_reply(
+        self, message: discord.Message, text: str, *, delay: float = TEMPORARY_REPLY_SECONDS
+    ) -> None:
+        """Reply, then delete the reply after a short delay.
+
+        Prefix commands cannot be ephemeral, so a refusal is cleaned up instead
+        of lingering in the ticket like a permanent error.
+        """
+        try:
+            reply = await message.reply(text, mention_author=False)
+        except discord.HTTPException:
+            return
+
+        async def _delete() -> None:
+            await asyncio.sleep(delay)
+            with contextlib.suppress(discord.HTTPException):
+                await reply.delete()
+
+        task = asyncio.create_task(_delete())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     def _strip_mention(self, message: discord.Message) -> str | None:
         """Return the prompt if this message mentions the bot, else None.

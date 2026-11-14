@@ -132,11 +132,13 @@ an owner without Manage Server would not see it under `/config`.
 | `/hello`, `/help` | General. |
 | `/hug`, `/punch`, `/kick`, ... | Fun actions. Every one also works as `!hug`, etc. |
 | `/report generate` | Build a draft report for a month (previous month by default). |
+| `/report preview` | Render the live numbers for a month without saving or posting anything. |
 | `/report view` | Preview the stored report; posts a `.md` file when it is long. |
-| `/report publish` | Post a report to the configured channel, or one you pass. |
+| `/report publish` | Post a report to the configured channel, or one you pass. Re-running it edits the existing message instead of posting a duplicate. |
 | `/report edit` | Write or replace one human-written section. |
 | `/report list` | Recent reports and their draft/published status. |
 | `/report test` | Verify the setup and post a test message to the report channel. |
+| `!log` | Manage Server only, in a `ticket…` channel. Summarises up to 1000 messages (plus the ticket bot's form) and posts `{channel}_{date}_{type}_log.json`; the same JSON, including the inferred ticket type, is stored in `guild_ticket_logs`. |
 
 Fun replies are chosen at random from a per-action list. Guilds can override the
 defaults, and a guild override takes precedence over the catalog default.
@@ -151,6 +153,29 @@ equivalents.
 `!candyp` (the **p** is for **personalized**) is the same as `!candy` plus the
 prompter's own recent turns. `!candyp` is checked before `!candy` with a word
 boundary, so it can never be swallowed by its shorter sibling.
+
+### Ticket logs (`!log`)
+
+`!log` works only in channels whose name starts with `ticket`, and only for
+members with Manage Server. It reads up to 1000 human messages (plus the ticket
+bot's opening form, if it has one), asks the AI for a four-key summary
+(`people_involved`, `when`, `why`, `ticket_type`), posts it as
+`{channel}_{date}_{type}_log.json` (for example
+`ticket-0001_2026-11-14_general-support_log.json`), and stores the same object
+in `guild_ticket_logs`.
+
+Every channel is named like `ticket-0001`, and the number restarts for each
+ticket type, so the name cannot identify the type. The AI infers it from the
+conversation and returns one of **General support**, **Reporting a user**,
+**Partnership request**, **Custom role**, **Staff application** or **Other**.
+A ticket bot's opening embed is included in what the AI reads, but the bot is
+never listed as a person. The same label is copied into a `ticket_type` column,
+and the monthly report shows the total tickets logged plus a count for every
+type.
+
+The transcript is chunked to fit the `chat` Edge Function's per-message limit.
+Only the summary is stored — the transcript itself is never written to the
+database or to disk.
 
 ---
 
@@ -330,11 +355,17 @@ survive regeneration. Nothing is posted automatically until an admin turns it on
 | Joins, leaves, boosts | gateway events plus `premium_since` transitions |
 | Warnings | parsed from **Dyno** mod-log embeds only |
 | Bans, kicks, unbans, timeouts | Discord **audit log** |
+| User reports | tickets whose AI-inferred type is “Reporting a user” |
+| Tickets | `!log` summaries, grouped by the AI-inferred ticket type |
 | Events | mirrored Discord scheduled events and participation counts |
 
 Counters live **in memory** and are flushed in one RPC per guild (default every
 5 minutes). A crash loses at most the current flush window; the bot does not
 write to the database on every message.
+
+Message and voice averages are divided by the days actually observed, not by
+calendar days, so bot downtime does not look like a drop in activity. The report
+also states how many days were observed and an approximate bot uptime.
 
 Message and voice rankings are deliberately **separate** — there is no combined
 "most active" score. Voice counts all connected time, including the AFK channel.
@@ -375,9 +406,14 @@ public bot, `155149108183695360`). `/config report staffroles` marks which roles
 count as staff.
 
 Generate on demand with `/report generate`, fill in the narrative sections with
-`/report edit`, preview with `/report view`, then `/report publish`. Reports are
-stored in `guild_reports` as `auto_data` (numbers) plus `narrative` (prose) plus
-the rendered markdown.
+`/report edit`, and check the live numbers at any time with `/report preview`
+(nothing is saved or posted). `/report view` shows the stored copy, and
+`/report publish` posts it. Publishing again edits the message it already
+posted instead of adding a duplicate, so an edit made after publishing is
+visible where people already read the report.
+
+Reports are stored in `guild_reports` as `auto_data` (numbers) plus `narrative`
+(prose) plus the rendered markdown.
 
 The scheduler generates only the **most recent** missed period. If the bot was
 offline for several months, older periods are logged as skipped instead of

@@ -209,6 +209,71 @@ class ReportCog(commands.Cog, name="Report"):
         )
 
     @report_group.command(
+        name="preview",
+        description="Render a report for a month without saving or posting it.",
+    )
+    @app_commands.describe(
+        year="Year, e.g. 2026. Leave both year and month empty for last month.",
+        month="Month 1-12. Leave both year and month empty for last month.",
+    )
+    async def preview(
+        self,
+        interaction: discord.Interaction,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> None:
+        """Show exactly what ``/report generate`` would produce right now.
+
+        Unlike ``/report view``, this does not need a stored draft, and unlike
+        ``generate`` it writes nothing, so it can never overwrite a published
+        report while an admin is still checking the numbers.
+        """
+        guild = await self._guild(interaction)
+        if guild is None:
+            return
+
+        period = await self._period(interaction, guild, year, month)
+        if period is None:
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            period, markdown = await self.service.preview(
+                guild, period=period, prepared_by=interaction.user.display_name
+            )
+        except ReportError as exc:
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.error("Report preview failed: %s", exc, exc_info=True)
+            await interaction.followup.send(
+                "Something went wrong rendering the preview. Check the bot logs.",
+                ephemeral=True,
+            )
+            return
+
+        allowed = discord.AllowedMentions.none()
+        header = f"📊 **Preview — {period.label}** (not saved)"
+        if len(markdown) <= 1900:
+            await interaction.followup.send(
+                content=f"{header}\n\n{markdown}",
+                ephemeral=True,
+                allowed_mentions=allowed,
+            )
+            return
+
+        file = discord.File(
+            io.BytesIO(markdown.encode("utf-8")),
+            filename=f"report-{period.start.isoformat()}-preview.md",
+        )
+        await interaction.followup.send(
+            content=header,
+            file=file,
+            ephemeral=True,
+            allowed_mentions=allowed,
+        )
+
+    @report_group.command(
         name="publish", description="Post a report to the report channel (or another channel)."
     )
     @app_commands.describe(
@@ -257,7 +322,7 @@ class ReportCog(commands.Cog, name="Report"):
                 return
 
         try:
-            published = await self.service.publish(
+            result = await self.service.publish(
                 row, target, channel_id=getattr(target, "id", None)
             )
         except ReportError as exc:
@@ -271,10 +336,12 @@ class ReportCog(commands.Cog, name="Report"):
             )
             return
 
+        published = result.row
         url = _message_url(published, guild.id)
         where = getattr(target, "mention", None) or "the channel"
+        verb = "Updated" if result.edited else "Published"
         await interaction.followup.send(
-            f"✅ Published **{period.label}** to {where}." + (f"\n{url}" if url else ""),
+            f"✅ {verb} **{period.label}** in {where}." + (f"\n{url}" if url else ""),
             ephemeral=True,
         )
 

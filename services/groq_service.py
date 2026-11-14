@@ -238,6 +238,100 @@ class GroqService:
             hydrate=hydrate,
         )
 
+    async def complete_json(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        model: str,
+        max_tokens: int = 1024,
+        temperature: float = 0.2,
+    ) -> str:
+        """One-off completion that returns the model's raw JSON text.
+
+        Unlike :meth:`respond_to_command`, this does NOT touch the guild's
+        stored conversation, cooldowns, or locks: a ticket export is a
+        standalone document, not a turn in the chat.
+
+        ``"json_object": True`` makes the Edge Function set Groq's
+        ``response_format`` to ``{"type": "json_object"}``, so the model is
+        forced to emit syntactically valid JSON. The caller owns parsing and
+        validation of that text - the envelope is not assumed to be
+        ``{reply, summary}``, so the Edge Function passes it through untouched.
+        """
+        if not self._service_key or not self._endpoint.startswith("http"):
+            raise GroqUnavailable("AI backend is not configured (missing Supabase credentials)")
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "json_object": True,
+        }
+        headers = {
+            "Authorization": f"Bearer {self._service_key}",
+            "Content-Type": "application/json",
+        }
+
+        last_error: Exception | None = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+                    response = await client.post(self._endpoint, json=payload, headers=headers)
+
+                if response.status_code == 429:
+                    raise GroqRateLimited(
+                        "The AI is being rate limited right now.",
+                        retry_after=_parse_retry_after(response),
+                    )
+
+                if response.status_code == 401:
+                    # See _complete: a 401 is caller auth, not the Groq secret.
+                    detail = _error_detail(response)
+                    raise GroqUnavailable(
+                        "Supabase rejected the bot's credentials "
+                        f"({detail}). Compare SUPABASE_SERVICE_KEY in the bot's "
+                        "env with the chat function's SUPABASE_SERVICE_ROLE_KEY "
+                        "secret.",
+                        retryable=False,
+                    )
+
+                if response.status_code == 503:
+                    detail = _error_detail(response)
+                    raise GroqUnavailable(
+                        f"AI backend is not configured ({detail}).",
+                        retryable=False,
+                    )
+
+                if response.status_code >= 500:
+                    raise GroqUnavailable(f"AI backend error {response.status_code}")
+
+                response.raise_for_status()
+                text = self._extract_result(response.json()).reply
+                if not text:
+                    raise GroqError("The AI returned an empty response.")
+                return text
+
+            except GroqRateLimited:
+                raise
+            except GroqUnavailable as exc:
+                last_error = exc
+                # Retry server-side blips, not auth/config problems.
+                if not exc.retryable:
+                    raise
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                last_error = GroqUnavailable(f"AI backend unreachable: {exc}")
+            except httpx.HTTPStatusError as exc:
+                last_error = GroqError(f"AI backend returned {exc.response.status_code}")
+            except Exception as exc:  # noqa: BLE001 - never let this crash a handler
+                last_error = GroqError(f"Unexpected AI failure: {exc}")
+
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+
+        log.error("AI JSON request failed after retries: %s", last_error, exc_info=last_error)
+        raise last_error or GroqError("AI request failed")
+
     def remaining_cooldown(self, guild_id: int, user_id: int, cooldown_seconds: int) -> float:
         """Seconds until this user may talk to the AI again (0 when ready)."""
         if cooldown_seconds <= 0:

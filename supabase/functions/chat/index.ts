@@ -153,7 +153,10 @@ Deno.serve(async (req: Request): Promise<Response> => {
     TEMPERATURE_MAX,
     DEFAULT_TEMPERATURE,
   );
-  const structured = body.structured !== false;
+  const jsonObject = body.json_object === true;
+  // json_object overrides the chat contract: the caller supplied its own schema,
+  // so do not append the {reply, summary} instruction.
+  const structured = body.structured !== false && !jsonObject;
 
   // --------------------------------------------------------------------
   // 4. Build the Groq request
@@ -179,7 +182,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     max_tokens: maxTokens,
     temperature,
   };
-  if (structured) {
+  if (structured || jsonObject) {
     groqPayload.response_format = { type: "json_object" };
   }
 

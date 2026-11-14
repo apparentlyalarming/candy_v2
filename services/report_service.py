@@ -36,6 +36,7 @@ import discord
 
 from db import supabase_client
 from services.config_service import ConfigService
+from services.ticket_log import TICKET_TYPE_ORDER
 from utils.logging_setup import get_logger
 from utils.timezones import resolve_zone
 
@@ -63,6 +64,18 @@ NOT_PROVIDED = "_(not provided)_"
 
 class ReportError(ValueError):
     """A report could not be generated, stored, or delivered."""
+
+
+@dataclass
+class PublishResult:
+    """Outcome of :meth:`ReportService.publish`.
+
+    ``edited`` is true when an already-published message was updated in place
+    instead of a second copy being posted.
+    """
+
+    row: dict[str, Any]
+    edited: bool = False
 
 
 @dataclass(frozen=True)
@@ -208,6 +221,38 @@ class ReportService:
         )
         return row
 
+    async def preview(
+        self,
+        guild: discord.Guild,
+        *,
+        period: ReportPeriod | None = None,
+        prepared_by: str = "Candy",
+        year: int | None = None,
+        month: int | None = None,
+    ) -> tuple[ReportPeriod, str]:
+        """Render the report WITHOUT saving it or posting it.
+
+        ``/report view`` shows a stored row; this shows what ``generate`` would
+        produce right now, which is what makes it safe to check the numbers and
+        the stored narrative before committing a draft. Nothing is written, so
+        a preview can never overwrite a published report.
+        """
+        config = self._config.get(guild.id)
+        period = period or period_for_config(config, year=year, month=month)
+        summary = await asyncio.to_thread(self._fetch_summary, guild.id, period)
+        summary = self._decorate(summary, guild, period, prepared_by)
+        existing = await asyncio.to_thread(
+            self._load_row, guild.id, period.start.isoformat()
+        )
+        markdown = render_report(
+            summary,
+            self._narrative_from(existing),
+            guild_name=guild.name,
+            period=period,
+            prepared_by=prepared_by,
+        )
+        return period, markdown
+
     def _fetch_summary(self, guild_id: int, period: ReportPeriod) -> dict[str, Any]:
         params: dict[str, Any] = {
             "p_guild_id": guild_id,
@@ -279,11 +324,23 @@ class ReportService:
                 "Member growth could not be calculated because a daily member "
                 "snapshot is missing for the start or end of the period."
             )
+        elif tracked is not None and tracked < period.days:
+            # The RPC takes the earliest/latest recorded snapshot, not the
+            # first/last day of the month, so a gap at a boundary makes the
+            # start/end figures "closest available" rather than exact.
+            notes.append(
+                "Member counts use the closest recorded day, which may not be "
+                "the first or last day of the period."
+            )
         if tracked == 0:
             notes.append("No activity was recorded for this period.")
         notes.append(
             "Leaves include members who were kicked or banned, because Discord "
             "does not distinguish them in the leave event."
+        )
+        notes.append(
+            "Warnings are read only from Dyno mod-log embeds; timeouts are "
+            "detected live and can be missed while the bot is offline."
         )
         summary["data_notes"] = notes
         return summary
@@ -347,8 +404,13 @@ class ReportService:
         channel: discord.abc.Messageable,
         *,
         channel_id: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> PublishResult:
         """Post the report and mark the row published.
+
+        If this report was already published to the same channel, the existing
+        message is EDITED instead of a second copy being posted. Editing leaves
+        a narrative change visible where people already read the report; posting
+        again would leave the old, stale copy above it.
 
         A report longer than Discord's 2000-character message limit is sent as
         a ``.md`` attachment instead of being split into a dozen messages. That
@@ -361,24 +423,77 @@ class ReportService:
         period_start = str(row.get("period_start") or "")
         content = f"📊 **Monthly report — {period_start[:7]}**"
         allowed = discord.AllowedMentions.none()
+        inline = len(markdown) <= 2000
+        target_id = channel_id or getattr(channel, "id", None)
 
-        try:
-            if len(markdown) <= 2000:
-                message = await channel.send(content=markdown, allowed_mentions=allowed)
-            else:
-                file = discord.File(
-                    io.BytesIO(markdown.encode("utf-8")),
-                    filename=f"report-{period_start or 'month'}.md",
+        def attachment() -> discord.File:
+            # A fresh File each attempt: a File consumed by a failed request
+            # cannot be re-sent at its current position.
+            return discord.File(
+                io.BytesIO(markdown.encode("utf-8")),
+                filename=f"report-{period_start or 'month'}.md",
+            )
+
+        message: discord.Message | None = None
+        edited = False
+
+        existing_message_id = row.get("published_message_id")
+        existing_channel_id = row.get("published_channel_id")
+        fetch = getattr(channel, "fetch_message", None)
+        can_edit = (
+            fetch is not None
+            and existing_message_id is not None
+            and existing_channel_id is not None
+            and target_id is not None
+            and int(existing_channel_id) == int(target_id)
+        )
+        if can_edit:
+            try:
+                message = await fetch(int(existing_message_id))
+                if inline:
+                    # attachments=[] removes the old .md when a report that
+                    # used to be long now fits in a single message.
+                    await message.edit(
+                        content=markdown, attachments=[], allowed_mentions=allowed
+                    )
+                else:
+                    await message.edit(
+                        content=content,
+                        attachments=[attachment()],
+                        allowed_mentions=allowed,
+                    )
+                edited = True
+            except discord.NotFound:
+                # The message was deleted; fall through and post a new one.
+                message = None
+                log.info(
+                    "Published report message %s was deleted; posting a new copy",
+                    existing_message_id,
                 )
-                message = await channel.send(
-                    content=content, file=file, allowed_mentions=allowed
+            except discord.HTTPException as exc:
+                message = None
+                log.warning(
+                    "Could not edit report message %s (%s); posting a new copy",
+                    existing_message_id,
+                    exc,
                 )
-        except discord.Forbidden as exc:
-            raise ReportError(
-                "I need Send Messages and (for a long report) Attach Files in that channel."
-            ) from exc
-        except discord.HTTPException as exc:
-            raise ReportError(f"Discord rejected the report message: {exc}") from exc
+
+        if message is None:
+            try:
+                if inline:
+                    message = await channel.send(
+                        content=markdown, allowed_mentions=allowed
+                    )
+                else:
+                    message = await channel.send(
+                        content=content, file=attachment(), allowed_mentions=allowed
+                    )
+            except discord.Forbidden as exc:
+                raise ReportError(
+                    "I need Send Messages and (for a long report) Attach Files in that channel."
+                ) from exc
+            except discord.HTTPException as exc:
+                raise ReportError(f"Discord rejected the report message: {exc}") from exc
 
         payload = {
             "guild_id": int(row["guild_id"]),
@@ -390,10 +505,11 @@ class ReportService:
             "narrative": row.get("narrative") or {},
             "markdown": markdown,
             "published_at": datetime.now(timezone.utc).isoformat(),
-            "published_channel_id": channel_id or getattr(channel, "id", None),
+            "published_channel_id": target_id,
             "published_message_id": message.id,
         }
-        return await asyncio.to_thread(self._upsert_row, payload)
+        stored = await asyncio.to_thread(self._upsert_row, payload)
+        return PublishResult(row=stored, edited=edited)
 
     async def delivery_probe(self, guild: discord.Guild) -> dict[str, Any]:
         """Health check for ``/report test``: read the current month so far.
@@ -486,8 +602,26 @@ def render_report(
     total_messages = _as_int(summary.get("total_messages")) or 0
     total_voice = _as_int(summary.get("total_voice_seconds")) or 0
     period_days = period.days
-    avg_messages = round(total_messages / period_days) if period_days else 0
-    avg_voice = round(total_voice / period_days) if period_days else 0
+    days_tracked = _as_int(summary.get("days_tracked"))
+    # Average over the days that were actually observed. Dividing by calendar
+    # days turns bot downtime into "members got quieter", which reads as a real
+    # trend when it is only a gap in collection.
+    observed_days = days_tracked if days_tracked and days_tracked > 0 else period_days
+    avg_messages = round(total_messages / observed_days) if observed_days else 0
+    avg_voice = round(total_voice / observed_days) if observed_days else 0
+    observed_note = (
+        f" (over {observed_days} observed days)"
+        if days_tracked is not None and observed_days != period_days
+        else ""
+    )
+    online_seconds = _as_int(summary.get("bot_online_seconds"))
+    uptime_pct = None
+    if online_seconds is not None and observed_days:
+        # bot_online_seconds is accumulated between flushes, so it is an
+        # approximate uptime rather than an exact one.
+        uptime_pct = max(
+            0, min(100, round(100 * online_seconds / (observed_days * 86400)))
+        )
 
     moderation = summary.get("moderation") or {}
     events = summary.get("events") or {}
@@ -512,6 +646,7 @@ def render_report(
     add("")
     add(f"- **Members at start:** {_fmt_num(member_start)}")
     add(f"- **Members at end:** {_fmt_num(member_end)}")
+    add(f"- **Members now:** {_fmt_num(summary.get('member_current'))}")
     add(f"- **Net growth:** {_fmt_delta(member_growth)}")
     add(f"- **Joins:** {_fmt_num(summary.get('total_joins'))}")
     add(f"- **Leaves:** {_fmt_num(summary.get('total_leaves'))}")
@@ -528,14 +663,19 @@ def render_report(
     add("")
     add("### Messages")
     add(f"- **Total messages:** {_fmt_num(total_messages)}")
-    add(f"- **Average per day:** {_fmt_num(avg_messages)}")
+    add(f"- **Average per day:** {_fmt_num(avg_messages)}{observed_note}")
     add(f"- **Most active day:** {_fmt_active_day(summary.get('most_active_day'))}")
     add(f"- **Most active hour:** {_fmt_active_hour(summary.get('most_active_hour'))}")
     add("")
     add("### Voice")
     add(f"- **Total voice time:** {_fmt_duration(total_voice)}")
     add(f"- **Voice joins:** {_fmt_num(summary.get('voice_joins'))}")
-    add(f"- **Average per day:** {_fmt_duration(avg_voice)}")
+    add(f"- **Average per day:** {_fmt_duration(avg_voice)}{observed_note}")
+    add("")
+    add("### Data Coverage")
+    tracked_label = "—" if days_tracked is None else _fmt_num(days_tracked)
+    add(f"- **Days observed:** {tracked_label} of {_fmt_num(period_days)}")
+    add(f"- **Bot uptime (approx.):** {_fmt_pct(uptime_pct)}")
     add("")
     add("### Most Active Members — Messages")
     add("")
@@ -609,9 +749,25 @@ def render_report(
     add(f"- **Kicks:** {_fmt_num(moderation.get('kicks'))}")
     add(f"- **Bans:** {_fmt_num(moderation.get('bans'))}")
     add(f"- **Unbans:** {_fmt_num(moderation.get('unbans'))}")
-    add(f"- **Reports:** {_fmt_num(moderation.get('reports'))}")
+    add(f"- **User reports (ticket type):** {_fmt_num(moderation.get('reports'))}")
     add(f"- **Issued via Dyno:** {_fmt_num(moderation.get('via_dyno'))}")
     add(f"- **Issued natively:** {_fmt_num(moderation.get('via_native'))}")
+    add("")
+    add("### Tickets Logged")
+    add("")
+    ticket_total = _as_int(moderation.get("tickets_logged")) or 0
+    add(f"- **Total tickets logged:** {_fmt_num(ticket_total)}")
+    by_type = moderation.get("tickets_by_type")
+    if not isinstance(by_type, dict):
+        by_type = {}
+    # Every known type is listed, including zeroes: "Partnership: 0" is useful
+    # information, while a missing row just looks like the report forgot it.
+    # Any unexpected label is still shown rather than silently dropped, so the
+    # type counts always add up to the total.
+    labels = list(TICKET_TYPE_ORDER)
+    labels.extend(sorted(key for key in by_type if key not in TICKET_TYPE_ORDER))
+    for label in labels:
+        add(f"- **{label}:** {_fmt_num(_as_int(by_type.get(label)) or 0)}")
     add("")
     add("### Staff Actions")
     add("")
@@ -747,6 +903,11 @@ def _first_not_none(*values: Any) -> Any:
 def _fmt_num(value: Any) -> str:
     number = _as_int(value)
     return "—" if number is None else f"{number:,}"
+
+
+def _fmt_pct(value: Any) -> str:
+    number = _as_int(value)
+    return "—" if number is None else f"{number}%"
 
 
 def _fmt_delta(value: Any) -> str:

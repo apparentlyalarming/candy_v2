@@ -11,6 +11,12 @@ export interface ChatRequestBody {
   temperature?: number;
   /** When true, ask the model for {reply, summary} JSON. Default true. */
   structured?: boolean;
+  /**
+   * When true, force Groq's JSON-object mode but pass the model's text back
+   * verbatim (no {reply, summary} contract). Used by one-off callers such as
+   * the Discord !log ticket summariser, which defines its own JSON schema.
+   */
+  json_object?: boolean;
 }
 
 export interface StructuredResult {

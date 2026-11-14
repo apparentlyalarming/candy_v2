@@ -105,6 +105,7 @@ const TABLES: Record<string, { order?: string; asc?: boolean }> = {
   guild_moderation_cursors: {},
   guild_events: { order: "start_time", asc: false },
   guild_reports: { order: "period_start", asc: false },
+  guild_ticket_logs: { order: "created_at", asc: false },
 };
 
 const GUILD_SELECT =
@@ -204,6 +205,7 @@ const BIGINT_COLUMNS: Record<string, string[]> = {
   guild_moderation_cursors: ["guild_id", "last_audit_id"],
   guild_events: ["guild_id", "event_id", "channel_id"],
   guild_reports: ["guild_id", "published_channel_id", "published_message_id"],
+  guild_ticket_logs: ["id", "guild_id", "channel_id", "generated_by"],
 };
 
 const BIGINT_ARRAY_COLUMNS: Record<string, string[]> = {

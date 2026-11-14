@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from datetime import datetime, timezone
 from typing import Any
 
 import discord
@@ -287,14 +288,17 @@ class ActivityCog(commands.Cog, name="Activity"):
 
     @commands.Cog.listener()
     async def on_scheduled_event_delete(self, event: discord.ScheduledEvent) -> None:
+        # Keep the row: a completed event that Discord drops is still part of
+        # the month's history. ``removed_at`` only hides it from "upcoming".
         try:
             await asyncio.to_thread(
-                supabase_client.delete,
+                supabase_client.update,
                 "guild_events",
+                {"removed_at": datetime.now(timezone.utc).isoformat()},
                 filters={"guild_id": event.guild.id, "event_id": event.id},
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning("Could not delete scheduled event %s: %s", event.id, exc)
+            log.warning("Could not mark scheduled event %s removed: %s", event.id, exc)
 
     async def _upsert_event(self, event: discord.ScheduledEvent) -> None:
         try:
@@ -308,7 +312,13 @@ class ActivityCog(commands.Cog, name="Activity"):
             log.warning("Could not store scheduled event %s: %s", event.id, exc)
 
     async def _sync_events(self, guild: discord.Guild) -> None:
-        """Mirror every scheduled event and drop rows for deleted ones."""
+        """Mirror every scheduled event, marking ones Discord no longer returns.
+
+        Deleting those rows would erase the completed-event history the report
+        depends on, so they are marked ``removed_at`` instead. A row that
+        reappears is upserted with ``removed_at = null`` and becomes visible
+        again.
+        """
         rows = [self._event_row(event) for event in guild.scheduled_events]
         if rows:
             await asyncio.to_thread(
@@ -322,15 +332,21 @@ class ActivityCog(commands.Cog, name="Activity"):
         stored = await asyncio.to_thread(
             supabase_client.select,
             "guild_events",
-            "event_id",
+            "event_id,removed_at",
             filters={"guild_id": guild.id},
         )
+        removed_at = datetime.now(timezone.utc).isoformat()
         for row in stored:
             event_id = row.get("event_id")
-            if event_id is not None and int(event_id) not in current:
+            if (
+                event_id is not None
+                and int(event_id) not in current
+                and row.get("removed_at") is None
+            ):
                 await asyncio.to_thread(
-                    supabase_client.delete,
+                    supabase_client.update,
                     "guild_events",
+                    {"removed_at": removed_at},
                     filters={"guild_id": guild.id, "event_id": int(event_id)},
                 )
 
@@ -348,6 +364,8 @@ class ActivityCog(commands.Cog, name="Activity"):
             "user_count": event.user_count,
             "subscriber_count": event.subscriber_count,
             "channel_id": getattr(event.channel, "id", None),
+            # Discord still returns it, so it is not removed (again).
+            "removed_at": None,
         }
 
 
