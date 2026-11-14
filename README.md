@@ -412,6 +412,12 @@ Generate on demand with `/report generate`, fill in the narrative sections with
 posted instead of adding a duplicate, so an edit made after publishing is
 visible where people already read the report.
 
+`/report generate` with no arguments covers the **previous calendar month**.
+Right after setup that month can predate activity tracking, so only audit-log
+entries (bans/kicks) appear and message counts are zero. The report says when
+tracking actually began and which `/report generate year:… month:…` command
+covers it. Pass `year` and `month` to build the current (partial) month instead.
+
 Reports are stored in `guild_reports` as `auto_data` (numbers) plus `narrative`
 (prose) plus the rendered markdown.
 

@@ -96,6 +96,37 @@ class ReportPeriod:
         return f"{self.start:%B %Y}"
 
 
+def tracking_hint(summary: dict[str, Any], period: ReportPeriod) -> str | None:
+    """Explain an empty period using the bot's real tracking range.
+
+    The default report period is the previous calendar month. Right after a
+    fresh install there is often no data for that month yet, and the report is
+    then all zeros apart from audit-log backfill. Returning a concrete
+    suggestion is more useful than leaving an admin to guess why.
+    """
+    if _as_int(summary.get("days_tracked")) != 0:
+        return None
+    first = _as_date(summary.get("first_tracked_day"))
+    if first is None:
+        return None
+    last = _as_date(summary.get("last_tracked_day"))
+    if first > period.end:
+        return (
+            f"No activity was recorded for **{period.label}** because tracking "
+            f"began on **{_fmt_date(first)}**. Generate that month with "
+            f"`/report generate year:{first.year} month:{first.month}`."
+        )
+    if last is not None and last < period.start:
+        return (
+            f"**{period.label}** predates activity tracking, which began on "
+            f"**{_fmt_date(first)}**."
+        )
+    return (
+        f"No activity was recorded for **{period.label}** even though tracking "
+        "covers part of it; the bot may have been offline."
+    )
+
+
 # ---------------------------------------------------------------------------
 # period resolution
 # ---------------------------------------------------------------------------
@@ -314,7 +345,10 @@ class ReportService:
 
         notes: list[str] = []
         tracked = _as_int(summary.get("days_tracked"))
-        if tracked is not None and tracked < period.days:
+        if tracked == 0:
+            hint = tracking_hint(summary, period)
+            notes.append(hint or "No activity was recorded for this period.")
+        elif tracked is not None and tracked < period.days:
             notes.append(
                 f"Activity data covers {tracked} of {period.days} days; gaps reflect "
                 "bot downtime or the period before tracking was enabled."
@@ -324,8 +358,6 @@ class ReportService:
                 "No member snapshot was recorded for this period, so member "
                 "growth is unavailable."
             )
-        if tracked == 0:
-            notes.append("No activity was recorded for this period.")
         notes.append(
             "Leaves include members who were kicked or banned, because Discord "
             "does not distinguish them in the leave event."

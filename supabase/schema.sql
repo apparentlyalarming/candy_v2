@@ -2008,6 +2008,17 @@ begin
                 count(*)::bigint                        as days_tracked
               from daily
         ),
+        tracking as (
+            -- The earliest/latest day this guild has ever been observed.
+            -- Lets the report explain an empty period instead of just showing
+            -- zeros: right after setup the default (previous month) can
+            -- predate tracking entirely.
+            select
+                min(day) as first_day,
+                max(day) as last_day
+              from public.guild_daily_stats
+             where guild_id = p_guild_id
+        ),
         bounds as (
             select
                 (select member_count from daily where member_count is not null
@@ -2192,6 +2203,8 @@ begin
             'guild_id', p_guild_id,
             'period_start', p_start,
             'period_end', p_end,
+            'first_tracked_day', (select first_day from tracking),
+            'last_tracked_day',  (select last_day  from tracking),
             'member_start', (select member_start from bounds),
             'member_start_day', (select member_start_day from bounds),
             'member_end',   (select member_end   from bounds),

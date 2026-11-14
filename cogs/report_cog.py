@@ -31,6 +31,7 @@ from services.report_service import (
     ReportPeriod,
     ReportService,
     period_for_config,
+    tracking_hint,
 )
 from utils.logging_setup import get_logger
 
@@ -167,6 +168,11 @@ class ReportCog(commands.Cog, name="Report"):
             f"Voice: **{_duration(summary.get('total_voice_seconds'))}**",
             f"Warnings: **{_num((summary.get('moderation') or {}).get('warns'))}**  •  "
             f"Bans: **{_num((summary.get('moderation') or {}).get('bans'))}**",
+        ]
+        hint = tracking_hint(summary, period)
+        if hint:
+            lines.append(f"⚠️ {hint}")
+        lines += [
             "",
             "Fill in the human sections with `/report edit`, then `/report publish`.",
         ]
