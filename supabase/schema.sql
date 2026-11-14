@@ -2012,8 +2012,12 @@ begin
             select
                 (select member_count from daily where member_count is not null
                   order by day asc  limit 1) as member_start,
+                (select day          from daily where member_count is not null
+                  order by day asc  limit 1) as member_start_day,
                 (select member_count from daily where member_count is not null
                   order by day desc limit 1) as member_end,
+                (select day          from daily where member_count is not null
+                  order by day desc limit 1) as member_end_day,
                 (select boost_count  from daily where boost_count  is not null
                   order by day desc limit 1) as boost_count
         ),
@@ -2189,7 +2193,9 @@ begin
             'period_start', p_start,
             'period_end', p_end,
             'member_start', (select member_start from bounds),
+            'member_start_day', (select member_start_day from bounds),
             'member_end',   (select member_end   from bounds),
+            'member_end_day',   (select member_end_day   from bounds),
             'member_growth',
                 case
                     when (select member_end from bounds) is not null

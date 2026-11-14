@@ -349,7 +349,7 @@ survive regeneration. Nothing is posted automatically until an admin turns it on
 
 | Data | How |
 |---|---|
-| Member count at month start/end | daily snapshot written by the activity flush |
+| Member count at month start/end | daily snapshot written by the activity flush; the actual snapshot date is shown when it is not the first/last day |
 | Messages | counted per day, hour, channel and member (bots excluded) |
 | Voice time | connected seconds per member and channel, including AFK |
 | Joins, leaves, boosts | gateway events plus `premium_since` transitions |

@@ -321,16 +321,8 @@ class ReportService:
             )
         if summary.get("member_start") is None or summary.get("member_end") is None:
             notes.append(
-                "Member growth could not be calculated because a daily member "
-                "snapshot is missing for the start or end of the period."
-            )
-        elif tracked is not None and tracked < period.days:
-            # The RPC takes the earliest/latest recorded snapshot, not the
-            # first/last day of the month, so a gap at a boundary makes the
-            # start/end figures "closest available" rather than exact.
-            notes.append(
-                "Member counts use the closest recorded day, which may not be "
-                "the first or last day of the period."
+                "No member snapshot was recorded for this period, so member "
+                "growth is unavailable."
             )
         if tracked == 0:
             notes.append("No activity was recorded for this period.")
@@ -599,6 +591,29 @@ def render_report(
     if member_growth is None and member_start is not None and member_end is not None:
         member_growth = member_end - member_start
 
+    # The snapshot days are the days the bot was actually running, which are
+    # not always the first/last day of the month. Show them instead of saying
+    # growth "could not be calculated" when the data exists, just later.
+    member_start_day = _as_date(summary.get("member_start_day"))
+    member_end_day = _as_date(summary.get("member_end_day"))
+    partial_snapshot = (
+        member_start_day is not None
+        and member_end_day is not None
+        and (member_start_day > period.start or member_end_day < period.end)
+    )
+    if partial_snapshot:
+        member_range = (
+            f" ({_fmt_date(member_start_day)} only)"
+            if member_start_day == member_end_day
+            else f" ({_fmt_date(member_start_day)} – {_fmt_date(member_end_day)})"
+        )
+    else:
+        member_range = ""
+    start_note = (
+        f" ({_fmt_date(member_start_day)})" if partial_snapshot else ""
+    )
+    end_note = f" ({_fmt_date(member_end_day)})" if partial_snapshot else ""
+
     total_messages = _as_int(summary.get("total_messages")) or 0
     total_voice = _as_int(summary.get("total_voice_seconds")) or 0
     period_days = period.days
@@ -644,10 +659,10 @@ def render_report(
     # 1 -------------------------------------------------------------------
     add("## 1. Server Overview")
     add("")
-    add(f"- **Members at start:** {_fmt_num(member_start)}")
-    add(f"- **Members at end:** {_fmt_num(member_end)}")
+    add(f"- **Members at start{start_note}:** {_fmt_num(member_start)}")
+    add(f"- **Members at end{end_note}:** {_fmt_num(member_end)}")
     add(f"- **Members now:** {_fmt_num(summary.get('member_current'))}")
-    add(f"- **Net growth:** {_fmt_delta(member_growth)}")
+    add(f"- **Net growth:** {_fmt_delta(member_growth)}{member_range}")
     add(f"- **Joins:** {_fmt_num(summary.get('total_joins'))}")
     add(f"- **Leaves:** {_fmt_num(summary.get('total_leaves'))}")
     add(f"- **Current boosts:** {_fmt_num(_first_not_none(summary.get('boost_count_current'), summary.get('boost_count')))}")
@@ -929,6 +944,20 @@ def _fmt_duration(seconds: Any) -> str:
     if hours:
         return f"{hours}h {minutes % 60}m"
     return f"{minutes}m"
+
+
+def _as_date(value: Any) -> date | None:
+    """Parse a ``date``/``datetime`` or ISO date string, else ``None``."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if value in (None, ""):
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
 
 
 def _fmt_date(value: Any) -> str:
