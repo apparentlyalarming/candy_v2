@@ -346,26 +346,39 @@ class QotdCog(commands.Cog, name="QOTD"):
             ),
         )
 
-    @qotd_group.command(name="add", description="Add a question to the end of the queue.")
-    @app_commands.describe(question="The question to ask.")
+    @qotd_group.command(
+        name="add",
+        description="Add one or more questions to the end of the queue (separate with |).",
+    )
+    @app_commands.describe(question="Question(s); separate multiple with |")
     async def add(self, interaction: discord.Interaction, question: str) -> None:
         if interaction.guild_id is None:
             await interaction.response.send_message("Server only.", ephemeral=True)
             return
 
+        questions = question.split("|")
         try:
-            row = await discord.utils.maybe_coroutine(
-                self.config.qotd_add, interaction.guild_id, question
+            rows = await discord.utils.maybe_coroutine(
+                self.config.qotd_add_many, interaction.guild_id, questions
             )
         except ConfigError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
 
         queue = await discord.utils.maybe_coroutine(self.config.qotd_queue, interaction.guild_id)
-        await interaction.response.send_message(
-            f"Added at position **{row.get('position')}**. Queue length is now {len(queue)}.",
-            ephemeral=True,
-        )
+        if len(rows) == 1:
+            message = (
+                f"Added at position **{rows[0].get('position')}**. "
+                f"Queue length is now {len(queue)}."
+            )
+        else:
+            positions = [int(row.get("position") or 0) for row in rows]
+            message = (
+                f"Added **{len(rows)}** questions at positions "
+                f"**{min(positions)}–{max(positions)}**. "
+                f"Queue length is now {len(queue)}."
+            )
+        await interaction.response.send_message(message, ephemeral=True)
 
     @qotd_group.command(name="list", description="List the queued questions.")
     @app_commands.describe(limit="How many to show (default 10).")

@@ -30,6 +30,7 @@ log = get_logger("services.config")
 MAX_PROMPT_LENGTH = 4000
 MAX_PREFIX_LENGTH = 5
 MAX_QUESTION_LENGTH = 500
+MAX_QOTD_BATCH = 25
 AI_TEMPERATURE_MIN = 0.0
 AI_TEMPERATURE_MAX = 2.0
 AI_MAX_TOKENS_MIN = 1
@@ -801,38 +802,79 @@ class ConfigService:
         return asked[:limit]
 
     def qotd_add(self, guild_id: int, question: str, *, created_by: Any = None) -> dict[str, Any]:
+        rows = self.qotd_add_many(guild_id, [question], created_by=created_by)
+        return rows[0]
+
+    def qotd_add_many(
+        self,
+        guild_id: int,
+        questions: Iterable[str],
+        *,
+        created_by: Any = None,
+    ) -> list[dict[str, Any]]:
+        """Append one or more questions in a single insert.
+
+        Empty segments are ignored so ``q1 | | q3`` adds two questions rather
+        than failing the whole batch. The batch is capped so one invocation
+        cannot dump an unbounded queue into the database.
+        """
         gid = to_id(guild_id)
         if gid is None:
             raise ConfigError("invalid guild id")
 
-        cleaned = (question or "").strip()
+        raw_items = [questions] if isinstance(questions, str) else list(questions)
+        cleaned: list[str] = []
+        for index, raw in enumerate(raw_items, start=1):
+            text = (raw or "").strip()
+            if not text:
+                continue
+            if len(text) > MAX_QUESTION_LENGTH:
+                label = "question" if len(raw_items) == 1 else f"question {index}"
+                raise ConfigError(
+                    f"{label} must be at most {MAX_QUESTION_LENGTH} characters"
+                )
+            cleaned.append(text)
+
         if not cleaned:
             raise ConfigError("question must not be blank")
-        if len(cleaned) > MAX_QUESTION_LENGTH:
-            raise ConfigError(f"question must be at most {MAX_QUESTION_LENGTH} characters")
+        if len(cleaned) > MAX_QOTD_BATCH:
+            raise ConfigError(f"add at most {MAX_QOTD_BATCH} questions at once")
 
         self._ensure_settings_row(gid)
         queue = self.qotd_queue(gid)
         next_position = (max((int(r.get("position") or 0) for r in queue), default=0)) + 1
 
-        payload: dict[str, Any] = {
-            "guild_id": gid,
-            "question": cleaned,
-            "position": next_position,
-        }
-        creator_id = to_id(created_by) if created_by is not None else None
         # created_by is a uuid column; a Discord int is not a uuid. Only set it
         # when the caller supplied a real uuid.
+        creator_uuid: str | None = None
         if isinstance(created_by, str) and _looks_like_uuid(created_by):
-            payload["created_by"] = created_by
-        elif creator_id is not None:
+            creator_uuid = created_by
+        elif to_id(created_by) is not None:
             log.debug("Ignoring non-uuid created_by for QOTD (%r)", created_by)
+
+        payload: list[dict[str, Any]] = []
+        for offset, text in enumerate(cleaned):
+            row: dict[str, Any] = {
+                "guild_id": gid,
+                "question": text,
+                "position": next_position + offset,
+            }
+            if creator_uuid is not None:
+                row["created_by"] = creator_uuid
+            payload.append(row)
 
         rows = supabase_client.upsert("qotd_questions", payload)
         if not rows:
-            raise ConfigError("failed to add question")
-        log.info("QOTD question added for guild %s at position %s", gid, next_position)
-        return rows[0]
+            raise ConfigError("failed to add question(s)")
+        rows.sort(key=lambda row: int(row.get("position") or 0))
+        log.info(
+            "QOTD added %d question(s) for guild %s at positions %s-%s",
+            len(rows),
+            gid,
+            next_position,
+            next_position + len(rows) - 1,
+        )
+        return rows
 
     def qotd_pop_next(self, guild_id: int) -> dict[str, Any] | None:
         """Return the next queued question without consuming it."""

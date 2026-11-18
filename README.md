@@ -110,7 +110,7 @@ Everything is editable from **both** Discord and the dashboard. In Discord:
 | `/config general` | Prefix, prefix commands toggle, log channel, log events, log toggle |
 | `/config chat` | AI toggle, model, system prompt, channels, context, memory, memory window, ignored channels, cooldown, temperature, max tokens |
 | `/config replies` | List, add, remove, toggle, reset fun action replies |
-| `/config qotd` | Toggle, time, timezone, channel, role, days, add, list, remove, next, skip |
+| `/config qotd` | Toggle, time, timezone, channel, role, days, add (pipe-delimited for multiple), list, remove, next, skip |
 | `/config report` | Toggle, channel, schedule, timezone, modlog, dyno, staffroles |
 | `/config dev renewed` | Bot owner only. Resets the host-renewal reminder clock. |
 All `/config` subcommands require **Manage Server**, except `/config dev renewed`
