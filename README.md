@@ -105,6 +105,7 @@ Everything is editable from **both** Discord and the dashboard. In Discord:
 
 | Command | Purpose |
 |---|---|
+| `/config menu` | Browse every setting in a dropdown menu. Same commands, no new settings. |
 | `/config status` | Current server setup at a glance |
 | `/config general` | Prefix, prefix commands toggle, log channel, log events, log toggle |
 | `/config chat` | AI toggle, model, system prompt, channels, context, memory, memory window, ignored channels, cooldown, temperature, max tokens |
@@ -116,6 +117,15 @@ All `/config` subcommands require **Manage Server**, except `/config dev renewed
 which requires being the **bot owner** — the host renewal is an account-level
 concern, not a per-server setting. `/renewal` is top-level for the same reason:
 an owner without Manage Server would not see it under `/config`.
+
+**Menus are optional shortcuts.** `/config menu`, `/qotd menu` and `/report menu`
+open an ephemeral, invoker-locked dropdown for the large command groups. They
+call the same command callbacks as the slash commands, so settings logic is not
+duplicated and the slash commands remain canonical. A command with no inputs
+runs immediately; booleans, fixed choices, channels, roles, and users become
+selects; free-form text and numbers open a modal after any selects are answered.
+Optional channel/role/user fields have a **Clear / use default** action. All
+three menus require **Manage Server**; only the bot owner sees the Dev category.
 
 ---
 
@@ -130,7 +140,9 @@ an owner without Manage Server would not see it under `/config`.
 | `!candyp <message>` | Personalized: also weighs the prompter's own recent history. |
 | `!help` | The same role-aware menu as `/help`, as a text command. |
 | `/hello`, `/help` | General. |
+| `/qotd menu` | Manage Server only. Browse every Question of the Day setting in a dropdown. |
 | `/hug`, `/punch`, `/kick`, ... | Fun actions. Every one also works as `!hug`, etc. |
+| `/report menu` | Manage Server only. Browse report actions and report settings in a dropdown. |
 | `/report generate` | Build a draft report for a month (previous month by default). |
 | `/report preview` | Render the live numbers for a month without saving or posting anything. |
 | `/report view` | Preview the stored report; posts a `.md` file when it is long. |

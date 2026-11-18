@@ -20,7 +20,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from cogs import bind_group_commands
+from cogs import bind_group_commands, menu_ui
 from config import settings
 from db.config_cache import GuildConfig
 from services.config_service import ConfigError, ConfigService, TimezoneError
@@ -563,6 +563,63 @@ class ReportCog(commands.Cog, name="Report"):
             lines.append("")
             lines.extend(f"⚠️ {n}" for n in notes)
         await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    @report_group.command(
+        name="menu",
+        description="Browse report actions and report settings in a menu.",
+    )
+    async def menu(self, interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        if not menu_ui.can_manage(interaction.user):
+            await interaction.response.send_message(
+                "You need **Manage Server** to use this menu.", ephemeral=True
+            )
+            return
+
+        pages: dict[str, menu_ui.Page] = {
+            "root": menu_ui.Page(
+                key="root",
+                title="Reports",
+                description="Pick what you want to do.",
+                items=(
+                    menu_ui.page_item(
+                        "Report actions",
+                        "Generate, preview, edit, publish, or test a report.",
+                        "actions",
+                        "📄",
+                    ),
+                    menu_ui.page_item(
+                        "Report settings",
+                        "Schedule, channel, timezone, and data sources.",
+                        "settings",
+                        "⚙️",
+                    ),
+                ),
+            ),
+            "actions": menu_ui.Page(
+                "actions",
+                "Report actions",
+                "Generate and publish monthly reports.",
+                menu_ui.command_items(report_group.commands, self),
+            ),
+            "settings": menu_ui.Page(
+                "settings",
+                "Report settings",
+                "The same commands as `/config report`.",
+                menu_ui.command_items(config_report_group.commands, self),
+            ),
+        }
+        spec = menu_ui.MenuSpec(
+            key="report",
+            title="📄 Monthly report",
+            description="Choose a category, then a command.",
+            root="root",
+            pages=pages,
+            parents={"actions": "root", "settings": "root"},
+        )
+        await menu_ui.open_menu(interaction, spec)
 
     # ------------------------------------------------------------------
     # /config report

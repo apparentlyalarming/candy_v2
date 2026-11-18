@@ -18,7 +18,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from cogs import bind_group_commands
+from cogs import bind_group_commands, menu_ui
 from db.config_cache import GuildConfig
 from services.config_service import ConfigError, ConfigService, TimezoneError
 from services.qotd_scheduler import (
@@ -60,6 +60,16 @@ def _build_qotd_group() -> app_commands.Group:
 
 
 qotd_group = _build_qotd_group()
+
+# A second, TOP-LEVEL /qotd group that contains only `menu`. This is additive:
+# /config qotd keeps every existing command, and /qotd becomes the friendlier
+# entry point people actually remember.
+MANAGE_GUILD_PERMS = discord.Permissions(manage_guild=True)
+qotd_menu_group = app_commands.Group(
+    name="qotd",
+    description="Question of the Day: browse the settings in a menu.",
+    default_permissions=MANAGE_GUILD_PERMS,
+)
 
 
 class QotdCog(commands.Cog, name="QOTD"):
@@ -460,6 +470,39 @@ class QotdCog(commands.Cog, name="QOTD"):
         )
         await interaction.response.send_message("Skipped and removed.", ephemeral=True)
 
+    # --- /qotd (top-level menu) -------------------------------------------
+
+    @qotd_menu_group.command(
+        name="menu",
+        description="Browse every Question of the Day setting in a menu.",
+    )
+    async def menu(self, interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        if not menu_ui.can_manage(interaction.user):
+            await interaction.response.send_message(
+                "You need **Manage Server** to use this menu.", ephemeral=True
+            )
+            return
+
+        page = menu_ui.Page(
+            key="root",
+            title="Question of the Day",
+            description=(
+                "Everything here is also available under `/config qotd`."
+            ),
+            items=menu_ui.command_items(qotd_group.commands, self),
+        )
+        spec = menu_ui.MenuSpec(
+            key="qotd",
+            title="❓ Question of the Day",
+            description="Pick a command to run.",
+            root="root",
+            pages={"root": page},
+        )
+        await menu_ui.open_menu(interaction, spec)
+
     # --- helper -----------------------------------------------------------
 
     async def _apply(self, interaction: discord.Interaction, operation, success: str) -> None:
@@ -529,6 +572,15 @@ async def setup(bot: commands.Bot) -> None:
 
     cog = QotdCog(bot, bot.config_service)  # type: ignore[attr-defined]
     await bot.add_cog(cog)
+
+    # Top-level /qotd only carries `menu`; register it explicitly like every
+    # other module-level group. Guard on identity for hot reloads.
+    existing = bot.tree.get_command(qotd_menu_group.name)
+    if existing is None:
+        bot.tree.add_command(qotd_menu_group)
+    elif existing is not qotd_menu_group:
+        log.warning("A different 'qotd' command is already registered; leaving it alone")
+
     # See cogs.bind_group_commands: module-level groups leave binding=None,
     # which makes every subcommand raise CommandSignatureMismatch.
     n = bind_group_commands(cog)

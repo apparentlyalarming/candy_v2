@@ -27,7 +27,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from cogs import bind_group_commands
+from cogs import bind_group_commands, menu_ui
 from services.config_service import ConfigError, ConfigService
 from services.render import preview
 from services.rotation_reminder import RenewalButtonView
@@ -150,6 +150,122 @@ class ConfigCog(commands.Cog, name="Config"):
         ]
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @config_group.command(
+        name="menu",
+        description="Browse every setting in a dropdown menu.",
+    )
+    async def menu(self, interaction: discord.Interaction) -> None:
+        """The discoverable face of the same commands.
+
+        Deliberately additive: every subcommand above still exists with the same
+        name and behaviour. The menu reads those command objects, so a new
+        subcommand shows up here without a second registration.
+        """
+        if interaction.guild_id is None:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        if not menu_ui.can_manage(interaction.user):
+            await interaction.response.send_message(
+                "You need **Manage Server** to use this menu.", ephemeral=True
+            )
+            return
+
+        # Imported lazily: both cogs build their groups on top of config_group,
+        # so importing them at module load would be circular.
+        from cogs.qotd_cog import qotd_group
+        from cogs.report_cog import config_report_group
+
+        qotd_cog = self.bot.get_cog("QOTD")
+        report_cog = self.bot.get_cog("Report")
+        include_dev = await self._is_bot_owner(interaction)
+
+        overview = [
+            command
+            for command in config_group.commands
+            if isinstance(command, app_commands.Command) and command.name == "status"
+        ]
+
+        pages: dict[str, menu_ui.Page] = {
+            "overview": menu_ui.Page(
+                "overview",
+                "Overview",
+                "The same answer as `/config status`.",
+                menu_ui.command_items(overview, self),
+            ),
+            "general": menu_ui.Page(
+                "general",
+                "General",
+                "Prefix, text commands, and logging.",
+                menu_ui.command_items(general_group.commands, self),
+            ),
+            "chat": menu_ui.Page(
+                "chat",
+                "Chat AI",
+                "Model, prompt, channels, memory, and limits.",
+                menu_ui.command_items(chat_group.commands, self),
+            ),
+            "replies": menu_ui.Page(
+                "replies",
+                "Replies",
+                "Fun action reply templates.",
+                menu_ui.command_items(replies_group.commands, self),
+            ),
+        }
+
+        if qotd_cog is not None:
+            pages["qotd"] = menu_ui.Page(
+                "qotd",
+                "Question of the Day",
+                "Schedule, channel, queue, and weekday rules.",
+                menu_ui.command_items(qotd_group.commands, qotd_cog),
+            )
+        if report_cog is not None:
+            pages["report"] = menu_ui.Page(
+                "report",
+                "Report settings",
+                "Monthly report schedule and data sources.",
+                menu_ui.command_items(config_report_group.commands, report_cog),
+            )
+        if include_dev:
+            pages["dev"] = menu_ui.Page(
+                "dev",
+                "Dev",
+                "Bot-owner maintenance commands.",
+                menu_ui.command_items(dev_group.commands, self),
+            )
+
+        # Built last so a category is only listed when its page actually exists
+        # (a cog can fail to load; the root must not link to a dead page).
+        categories = [
+            ("overview", "Overview", "One-screen summary of this server's setup.", "📊"),
+            ("general", "General", "Prefix, text commands, and logging.", "🔧"),
+            ("chat", "Chat AI", "Model, prompt, channels, memory, and limits.", "🧠"),
+            ("replies", "Replies", "Fun action reply templates.", "🎉"),
+            ("qotd", "Question of the Day", "Schedule, channel, queue, and weekday rules.", "❓"),
+            ("report", "Report settings", "Monthly report schedule and data sources.", "📄"),
+            ("dev", "Dev", "Bot-owner maintenance commands.", "🛠️"),
+        ]
+        pages["root"] = menu_ui.Page(
+            key="root",
+            title="Settings",
+            description="Pick a category. Everything here is also a slash command.",
+            items=tuple(
+                menu_ui.page_item(label, description, key, emoji)
+                for key, label, description, emoji in categories
+                if key in pages
+            ),
+        )
+
+        spec = menu_ui.MenuSpec(
+            key="config",
+            title="⚙️ Server settings",
+            description="Choose a category, then a command.",
+            root="root",
+            pages=pages,
+            parents={key: "root" for key in pages if key != "root"},
+        )
+        await menu_ui.open_menu(interaction, spec)
 
     # ==================================================================
     # /config general

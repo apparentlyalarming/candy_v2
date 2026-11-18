@@ -4,6 +4,7 @@
 
 # --- Local working log (not repo content, per project convention) -------------
 buildplan.txt
+buildplan_archive_*.txt
 
 # --- Secrets: NEVER commit these ---------------------------------------------
 .env

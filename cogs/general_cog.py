@@ -187,6 +187,8 @@ class GeneralCog(commands.Cog, name="General"):
             embed.add_field(
                 name="⚙️ Admin",
                 value=(
+                    "**New:** `/config menu`, `/qotd menu` and `/report menu` "
+                    "let you browse every setting in a dropdown menu.\n"
                     "`/config status` - see this server's setup\n"
                     "`/config general` - prefix and log channel\n"
                     "`/config chat` - AI model, prompt, channels, memory\n"
